@@ -2,6 +2,11 @@
 
 Cabinet 2.0 is a prototype web application connecting dental practices, dental laboratories, and couriers. It tracks dental prosthesis orders from prescription through production and delivery. The interface is in French, and prices are expressed in Moroccan dirhams (MAD).
 
+> **Current development checkpoint: PostgreSQL / django-tenants / CQRS.**
+> Start with [other-PC setup](OTHER_PC_SETUP.md) and [model handoff](MODEL_HANDOFF.md).
+> Clone branch `feat/labo-config-and-ui` for this checkpoint. Backend/frontend integration remains unfinished.
+> Older prototype documentation below describes SQLite and obsolete workflow/pricing. Use the handoff documents for current setup and business rules.
+
 ## Features
 
 - **Dentist portal:** create prescriptions with a patient reference, interactive tooth chart, shade guide, and material selection. View a calculated quote and track orders.

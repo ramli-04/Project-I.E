@@ -1,8 +1,103 @@
 from rest_framework import serializers
-from .models import Prescription, StaffMember, Equipment, StockItem
+from .models import (
+    Prescription, StaffMember, Equipment, StockItem,
+    EmployeeProfile, Machine, Inventory, PartnerClinic, InventoryTransaction,
+)
+import math
 from .workflow import workflow_steps, next_status, LABELS
 from django.utils import timezone
 from copy import copy
+
+
+class EmployeeProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeProfile
+        fields = ['id', 'user', 'role', 'contract_type', 'hire_date', 'is_available']
+        read_only_fields = ['id']
+
+
+class MachineSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Machine
+        fields = ['id', 'name', 'machine_type', 'capacity', 'status']
+        read_only_fields = ['id']
+
+
+class InventorySerializer(serializers.ModelSerializer):
+    is_low_stock = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Inventory
+        fields = ['id', 'material_name', 'quantity', 'unit', 'alert_threshold', 'unit_cost', 'is_low_stock']
+        read_only_fields = ['id']
+
+    def validate_quantity(self, value):
+        if self.instance and value != self.instance.quantity:
+            raise serializers.ValidationError('Use an inventory transaction to change the balance.')
+        if not math.isfinite(value):
+            raise serializers.ValidationError('Quantity must be finite.')
+        return value
+
+    def validate_unit(self, value):
+        if self.instance and value != self.instance.unit:
+            raise serializers.ValidationError('The unit cannot change after an opening ledger entry.')
+        return value
+
+    def validate_alert_threshold(self, value):
+        if not math.isfinite(value):
+            raise serializers.ValidationError('Alert threshold must be finite.')
+        return value
+
+
+class PartnerClinicSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerClinic
+        fields = ['id', 'name', 'pickup_address', 'contact_phone', 'contact_email', 'linked_dentist', 'platform_dentist']
+        read_only_fields = ['id']
+
+    def validate_platform_dentist(self, value):
+        if value and (value.role != 'DENTIST' or not value.is_active):
+            raise serializers.ValidationError('Choose an active platform dentist account.')
+        return value
+
+
+class InventoryTransactionSerializer(serializers.ModelSerializer):
+    idempotency_key = serializers.UUIDField()
+    quantity_changed = serializers.DecimalField(max_digits=20, decimal_places=6, required=False)
+    transaction_type = serializers.ChoiceField(choices=['USAGE', 'RESTOCK', 'REWORK_LOSS', 'REVERSAL'])
+
+    class Meta:
+        model = InventoryTransaction
+        fields = '__all__'
+        read_only_fields = ['id', 'created_at', 'changed_by', 'production_attempt', 'source_history',
+                            'reclassifies', 'unit_snapshot', 'material_name_snapshot', 'unit_cost_snapshot', 'balance_after']
+        validators = []  # Command idempotency is checked under a database lock, including payload equality.
+
+    def validate(self, attrs):
+        source = attrs.get('reversal_of')
+        if attrs['transaction_type'] == 'REVERSAL':
+            if source is None:
+                raise serializers.ValidationError({'reversal_of': 'A source movement is required.'})
+            if source.inventory_item_id != attrs['inventory_item'].pk:
+                raise serializers.ValidationError({'inventory_item': 'The correction must use the source inventory item.'})
+            attrs['quantity_changed'] = -source.quantity_changed
+            attrs['prescription'] = source.prescription
+        elif source:
+            raise serializers.ValidationError({'reversal_of': 'Only REVERSAL may reference a correction source.'})
+        if 'quantity_changed' not in attrs:
+            raise serializers.ValidationError({'quantity_changed': 'This field is required.'})
+        return attrs
+
+    def create(self, validated_data):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from django.db import IntegrityError
+        from .inventory import record_movement
+        try:
+            return record_movement(**validated_data, changed_by=PrescriptionSerializer._audit_actor(self))
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', exc.messages)) from exc
+        except IntegrityError as exc:
+            raise serializers.ValidationError('Conflicting movement or invalid inventory correction.') from exc
 
 
 class StaffMemberSerializer(serializers.ModelSerializer):
@@ -38,99 +133,4 @@ class StockItemSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class PrescriptionSerializer(serializers.ModelSerializer):
-    """
-    Serializer for Prescription.
-    Enforces the "Verrou Sanitaire": rejects any submission where
-    disinfected is False — mirroring the frontend lock.
-
-    On CREATE: status, delivery_date, billing_stage are read-only (server defaults apply).
-    On update: validate sequential workflow transitions and required checkpoints.
-    Route selection is locked once technical production starts; history is server-managed.
-    """
-
-    workflow_steps = serializers.SerializerMethodField()
-    next_status = serializers.SerializerMethodField()
-    status_label = serializers.SerializerMethodField()
-
-    def get_workflow_steps(self, obj):
-        return workflow_steps(obj)
-
-    def get_next_status(self, obj):
-        return next_status(obj)
-
-    def get_status_label(self, obj):
-        return LABELS.get(obj.status, obj.status)
-
-    class Meta:
-        model = Prescription
-        fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "delivery_pin", "workflow_history", "accepted_at", "received_at", "dentist_account"]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # On creation (no instance yet), lock workflow fields as read-only
-        if self.instance is None:
-            self.fields["status"].read_only = True
-            self.fields["delivery_date"].read_only = True
-            self.fields["billing_stage"].read_only = True
-            for field in ['production_method', 'thermal_treatment', 'analysis_validated', 'reception_validated', 'quality_validated', 'technical_notes', 'accepted', 'is_paused', 'pause_reason', 'current_issues']:
-                self.fields[field].read_only = True
-
-    def validate(self, attrs):
-        if not self.instance:
-            return attrs
-        order = copy(self.instance)
-        old_status = order.status
-        for key, value in attrs.items():
-            setattr(order, key, value)
-        if attrs.get('impression_type', self.instance.impression_type) != self.instance.impression_type:
-            raise serializers.ValidationError({'impression_type': 'Le type d’empreinte ne peut plus être modifié après l’envoi.'})
-        if self.instance.accepted and not order.accepted:
-            raise serializers.ValidationError({'accepted': 'Une commande acceptée ne peut pas revenir dans les nouvelles demandes.'})
-        if order.is_paused and not order.pause_reason.strip():
-            raise serializers.ValidationError({'pause_reason': 'Indiquez le motif de la pause.'})
-        planning_stages = {'DEMANDE_RECUE', 'ANALYSE_DEMANDE', 'ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO', 'A_CONFIRMER', 'CONTROLE_DOSSIER', 'PLANIFICATION'}
-        if old_status not in planning_stages:
-            for field in ['production_method', 'thermal_treatment']:
-                if getattr(order, field) != getattr(self.instance, field):
-                    raise serializers.ValidationError({field: 'Le parcours est verrouillé après le lancement de la fabrication.'})
-        if order.status != old_status:
-            if not order.accepted:
-                raise serializers.ValidationError({'accepted': 'Acceptez la commande avant de commencer le travail.'})
-            if order.is_paused:
-                raise serializers.ValidationError({'is_paused': 'Reprenez la commande avant de changer d’étape.'})
-            previous = copy(order)
-            previous.status = old_status
-            if order.status != next_status(previous):
-                raise serializers.ValidationError({'status': 'Avancez uniquement vers la prochaine étape du parcours.'})
-            if old_status == 'ANALYSE_DEMANDE' and not order.analysis_validated:
-                raise serializers.ValidationError({'analysis_validated': 'Validez l’analyse de la demande.'})
-            if old_status == 'A_CONFIRMER' and not order.reception_validated:
-                raise serializers.ValidationError({'reception_validated': 'Confirmez la réception et la conformité des éléments.'})
-            if old_status == 'PLANIFICATION':
-                if not order.production_method:
-                    raise serializers.ValidationError({'production_method': 'Choisissez une méthode de fabrication.'})
-                if not order.delivery_date:
-                    raise serializers.ValidationError({'delivery_date': 'Renseignez la date de livraison prévue.'})
-            if old_status == 'CONTROLE_QUALITE' and not order.quality_validated:
-                raise serializers.ValidationError({'quality_validated': 'Validez le contrôle qualité avant le conditionnement.'})
-        return attrs
-
-    def update(self, instance, validated_data):
-        if validated_data.get('accepted') and not instance.accepted:
-            validated_data['accepted_at'] = timezone.now()
-        if validated_data.get('reception_validated') and not instance.reception_validated:
-            validated_data['received_at'] = timezone.now()
-        new_status = validated_data.get('status', instance.status)
-        if new_status != instance.status:
-            validated_data['workflow_history'] = [*instance.workflow_history, {'status': new_status, 'at': timezone.now().isoformat()}]
-        return super().update(instance, validated_data)
-
-    def validate_disinfected(self, value):
-        if not value:
-            raise serializers.ValidationError(
-                "Le verrou sanitaire est obligatoire. "
-                "Les empreintes doivent être désinfectées avant envoi."
-            )
-        return value
+from .case_serializers import PrescriptionSerializer  # noqa: E402,F401

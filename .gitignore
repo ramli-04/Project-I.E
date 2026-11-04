@@ -7,4 +7,27 @@ __pycache__/
 .env
 cabinet_backend/build/
 cabinet_backend/dist/Cabinet2/
-!cabinet_backend/dist/Cabinet2_App.zip
+cabinet_backend/dist/
+cabinet_backend/frontend_build/
+cabinet_frontend/dist/
+
+# Local Graphify environment and generated analysis
+.graphify-venv/
+graphify-out/
+
+# Machine-local database credentials
+cabinet_backend/cabinet_backend/local_settings.py
+.runtime/
+private_media/
+
+# Local secrets, database exports and reproducible artifacts
+.env.*
+!.env.example
+*.dump
+*.backup
+*.sql.gz
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+celerybeat-schedule*

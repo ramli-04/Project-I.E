@@ -4,7 +4,8 @@ import platform from "./api/platform";
 import DemoLogin from "./DemoLogin";
 import AdminPortal from "./AdminPortal";
 import SupportButton from "./SupportButton";
-import LabConfiguration from "./LabConfiguration";
+import LabBusinessConfiguration from "./LabBusinessConfiguration";
+import LabAdminLayout from "./LabAdminLayout";
 import { LabOverview, OrderManagement } from "./LabWorkspace";
 import { AlertPopup } from './LabAlerts';
 import { useLabAlerts } from './useLabAlerts';
@@ -32,7 +33,7 @@ export default function App() {
   const fetchOrders = useCallback(async () => {
     try {
       if (user?.role === 'Administrateur') return;
-      const res = user?.role === 'Cabinet Dentaire' ? await platform.get('dentist/orders/') : await api.get("prescriptions/");
+      const res = user?.role === 'Cabinet Dentaire' ? await platform.get('dentist/orders/') : await api.get("prescriptions/", { params: { include_completed: true } });
       setOrders(res.data);
     } catch (e) {
       console.error("API Error", e);
@@ -44,6 +45,25 @@ export default function App() {
   }, [user, fetchOrders]);
 
   if (!user) return <DemoLogin setUser={setUser} courierLogin={<LoginScreen setUser={setUser} />} />;
+
+  if (user.role === 'Laboratoire') return <LabAdminLayout
+    section={labSection}
+    laboratoryName={tenant?.name || tenant?.id}
+    onNavigate={section => { if (section === 'configuration') setConfigTarget(null); setLabSection(section); }}
+    accountMenu={<><SupportButton /><AccountMenu user={user} tenant={tenant} onLogout={() => {
+      const token = sessionStorage.getItem('demo_token');
+      if (token) platform.post('logout/', {}, { headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+      sessionStorage.removeItem('demo_token');
+      sessionStorage.removeItem('demo_user');
+      setUser(null); setOrders([]); setLabSection('main'); setLabTab('dashboard'); setConfigTarget(null); clearTenant();
+    }} /></>}
+  >
+    <LabPortal key={tenant?.id} section={labSection} activeTab={labTab} setActiveTab={setLabTab} configTarget={configTarget} alertState={alertState} alertFocus={alertFocus} onAlertSelect={alert => {
+      setConfigTarget({ section: alert.section, id: alert.resource_id, request: Date.now() });
+      setLabSection('configuration');
+    }} orders={orders} refresh={fetchOrders} />
+    <AlertPopup alerts={alertState.alerts} onOpen={() => { setLabSection('main'); setLabTab('dashboard'); setAlertFocus(value => value + 1); }} />
+  </LabAdminLayout>;
 
   return (
     <div className="flex h-screen bg-[#0d0914] text-white font-sans overflow-hidden">
@@ -603,7 +623,7 @@ function LabPortal({ section, orders, refresh, activeTab, setActiveTab, configTa
     await api.patch(`prescriptions/${id}/`, payload);
     await refresh();
   };
-  if (section === 'configuration') return <LabConfiguration key={configTarget?.request || 'configuration'} target={configTarget} />;
+  if (section === 'configuration') return <LabBusinessConfiguration key={configTarget?.request || 'configuration'} target={configTarget} />;
   if (section === 'orders') return <OrderManagement orders={orders} patchOrder={patchOrder} />;
   if (section === 'billing') return <div className="space-y-6"><div><p className="text-xs uppercase tracking-widest text-sky-400">Gestion</p><h1 className="mt-2 text-2xl font-semibold">Facturation</h1></div><BillingPipeline orders={orders} patchOrder={patchOrder} /></div>;
   return <LabOverview orders={orders} tab={activeTab} setTab={setActiveTab} alertState={alertState} alertFocus={alertFocus} onAlertSelect={onAlertSelect} />;

@@ -22,3 +22,10 @@ api.interceptors.request.use((config) => {
 });
 
 export default api;
+api.interceptors.response.use(response => response, error => {
+  if (error.response?.status === 401) {
+    sessionStorage.removeItem('demo_token'); sessionStorage.removeItem('demo_user');
+    window.dispatchEvent(new Event('cabinet-session-expired'));
+  }
+  return Promise.reject(error);
+});

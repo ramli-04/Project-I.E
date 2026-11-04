@@ -1,0 +1,14 @@
+﻿# Analyze source rather than installed packages, release bundles, or generated assets.
+.graphify-venv/
+.agents/
+graphify-out/
+venv/
+node_modules/
+**/build/
+**/dist/
+**/frontend_build/
+**/__pycache__/
+**/*.sqlite3
+**/*.zip
+**/*.exe
+**/package-lock.json

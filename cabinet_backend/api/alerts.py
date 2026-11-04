@@ -1,6 +1,6 @@
 from datetime import timedelta
 from django.utils import timezone
-from .models import Equipment, StaffMember, StockItem
+from .models import Equipment, StaffMember, StockItem, Inventory, MonthlyStockLossCatalog
 
 
 def laboratory_alerts(today=None):
@@ -8,12 +8,13 @@ def laboratory_alerts(today=None):
     deadline = today + timedelta(days=7)
     alerts = []
 
-    def add(kind, section, item, message, date=None):
+    def add(kind, section, item, message, date=None, reference=None, name=None):
         alerts.append({
             'id': f'{kind}-{item.pk}', 'type': kind, 'section': section,
-            'resource_id': item.pk, 'name': item.name, 'reference': item.reference,
+            'resource_id': item.pk, 'name': name or getattr(item, 'name', str(item)),
+            'reference': reference or getattr(item, 'reference', str(item.pk)),
             'message': message, 'due_date': date.isoformat() if date else None,
-            'overdue': bool(date and date < today),
+            'overdue': bool(date and date < today) if date else (kind in {'stock', 'loss'}),
         })
 
     def date_message(date):
@@ -29,6 +30,23 @@ def laboratory_alerts(today=None):
             add('stock', 'stock', item, f'Votre stock de « {item.name} » est au seuil d’alerte ou en dessous : {item.quantity:g} {item.unit} restant(s), seuil {item.minimum_quantity:g} {item.unit}.')
         if item.expiry_date and item.expiry_date < today:
             add('expiry', 'stock', item, f'Votre stock de « {item.name} » est périmé depuis le {item.expiry_date:%d/%m/%Y}.', item.expiry_date)
+
+    for item in Inventory.objects.all():
+        if item.is_low_stock:
+            add('stock', 'inventory', item,
+                f'Le stock de matière « {item.material_name} » est au seuil d’alerte ou en dessous : {item.quantity:g} {item.unit} restant(s), seuil {item.alert_threshold:g} {item.unit}.',
+                reference=item.material_name, name=item.material_name)
+
+    for catalog in MonthlyStockLossCatalog.objects.filter(complete_valuation=False):
+        alerts.append({
+            'id': f'loss-valuation-{catalog.pk}', 'type': 'loss', 'section': 'inventory',
+            'resource_id': catalog.pk, 'name': catalog.inventory_item.material_name,
+            'reference': catalog.inventory_item.material_name,
+            'message': f'Pertes matières de « {catalog.inventory_item.material_name} » pour {catalog.loss_month:%Y-%m} avec valorisation incomplète ({catalog.unvalued_quantity:g} {catalog.inventory_item.unit} sans coût unitaire).',
+            'due_date': None,
+            'overdue': True,
+        })
+
     for item in Equipment.objects.filter(maintenance_date__lte=deadline):
         add('maintenance', 'equipment', item, f'La maintenance de votre machine « {item.name} » {date_message(item.maintenance_date)}.', item.maintenance_date)
     for item in StaffMember.objects.all():
