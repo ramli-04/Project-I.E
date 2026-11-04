@@ -7,6 +7,8 @@ Cabinet 2.0 is a prototype web application connecting dental practices, dental l
 > Clone branch `feat/labo-config-and-ui` for this checkpoint. Backend/frontend integration remains unfinished.
 > Older prototype documentation below describes SQLite and obsolete workflow/pricing. Use the handoff documents for current setup and business rules.
 
+Frontend integration now has a separate [implementation and validation checkpoint](FRONTEND_INTEGRATION.md), including browser tests and the remaining live backend checks.
+
 ## Features
 
 - **Dentist portal:** create prescriptions with a patient reference, interactive tooth chart, shade guide, and material selection. View a calculated quote and track orders.

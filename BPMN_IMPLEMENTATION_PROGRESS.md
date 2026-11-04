@@ -1,5 +1,7 @@
 # BPMN remediation implementation
 
+Frontend follow-up: [FRONTEND_INTEGRATION.md](FRONTEND_INTEGRATION.md) records implemented React workflows and mocked browser validation. Tenant migrations, full backend regression and deployment validation remain pending.
+
 User approved the full prioritized audit roadmap. Work remains active until implementation, verification and deployment complete.
 
 Confirmed business decisions:

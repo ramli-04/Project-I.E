@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-label="Gestion Labo">
+  <rect width="64" height="64" rx="18" fill="#2d8076"/>
+  <path d="M21 15c-8-3-13 4-10 13l5 13c2 6 3 12 7 12 4 0 4-13 9-13s5 13 9 13c4 0 5-6 7-12l5-13c3-9-2-16-10-13-7 3-15 3-22 0Z" fill="#fff" transform="translate(4 2) scale(.88)"/>
+  <path d="M24 22c4 3 10 4 15 1" fill="none" stroke="#b7dcd2" stroke-linecap="round" stroke-width="2"/>
+  <path d="m48 10 1.6 4.4L54 16l-4.4 1.6L48 22l-1.6-4.4L42 16l4.4-1.6Z" fill="#c6e8d8"/>
+</svg>

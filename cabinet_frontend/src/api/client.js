@@ -1,6 +1,7 @@
 import axios from "axios";
+import { previewAdapter, previewMode } from './preview';
 
-const api = axios.create();
+const api = axios.create(previewMode ? { adapter: previewAdapter } : {});
 const tenantIdPattern = /^[a-z0-9][a-z0-9-]*$/;
 
 api.interceptors.request.use((config) => {

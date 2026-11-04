@@ -1,5 +1,7 @@
 # Cabinet 2.0 — development handoff
 
+> Frontend follow-up on 4 November 2026: see [FRONTEND_INTEGRATION.md](FRONTEND_INTEGRATION.md). The previously missing case panels, stock/lot workspace, finance and operations screens now exist in source. Browser validation uses mocked contracts; live backend integration and the backend follow-ups below remain pending. The older frontend section describes the incoming checkpoint.
+
 Snapshot: 4 November 2026. Latest user request was documentation for another PC/model; implementation paused at this snapshot. This file takes precedence over older progress notes where statuses differ.
 
 ## Paste this into the next coding model

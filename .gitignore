@@ -31,3 +31,5 @@ private_media/
 .coverage
 htmlcov/
 celerybeat-schedule*
+cabinet_frontend/test-results/
+cabinet_frontend/playwright-report/
