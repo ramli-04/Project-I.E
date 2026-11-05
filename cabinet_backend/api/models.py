@@ -9,6 +9,7 @@ from django.utils import timezone
 
 
 class EmployeeProfile(models.Model):
+    platform_account = models.OneToOneField('customers.PlatformAccount', null=True, blank=True, on_delete=models.PROTECT, related_name='+')
     class Role(models.TextChoices):
         RECEPTION = 'RECEPTION', 'Reception'
         CAO = 'CAO', 'CAO'
@@ -39,6 +40,7 @@ class Machine(models.Model):
         SCANNER = 'SCANNER', 'Scanner'
         USINEUSE_CNC = 'USINEUSE_CNC', 'CNC milling machine'
         FOUR_FRITTAGE = 'FOUR_FRITTAGE', 'Sintering furnace'
+        IMPRESSION_3D = 'IMPRESSION_3D', '3D printer'
 
     class Status(models.TextChoices):
         ACTIF = 'ACTIF', 'Active'
@@ -382,6 +384,8 @@ class Prescription(models.Model):
                 if fields is not None:
                     kwargs['update_fields'] = set(kwargs.get('update_fields', fields)) | {'invoiced_at', 'invoiced_amount', 'invoiced_clinic_name'}
             super().save(*args, **kwargs)
+            from .planning import source_saved
+            source_saved(self)
 
     def __str__(self):
         return f"{self.patient_ref} | Dent {self.tooth_number} | {self.material} | {self.status}"
@@ -602,7 +606,7 @@ class InventoryTransaction(models.Model):
 class TaskOutbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_key = models.CharField(max_length=255, unique=True)
-    event_type = models.CharField(max_length=20, choices=[('CALENDAR', 'Calendar calculation'), ('INVOICE', 'Invoice PDF generation'), ('CACHE', 'Cache invalidation'), ('CREDIT', 'Credit note PDF'), ('CATALOG', 'Catalog refresh')])
+    event_type = models.CharField(max_length=20, choices=[('PLANNING', 'Production planning'), ('CALENDAR', 'Calendar calculation'), ('INVOICE', 'Invoice PDF generation'), ('CACHE', 'Cache invalidation'), ('CREDIT', 'Credit note PDF'), ('CATALOG', 'Catalog refresh')])
     prescription = models.ForeignKey(Prescription, on_delete=models.PROTECT, related_name='task_events')
     created_at = models.DateTimeField(auto_now_add=True)
     next_attempt_at = models.DateTimeField(default=timezone.now, db_index=True)
@@ -680,3 +684,5 @@ from .business_models import (  # noqa: E402,F401 -- register tenant models with
     CaseCommandReceipt, BillingDispute,
     CreditDocument, MonthlyFinancialCatalog,
 )
+
+from .planning_models import (PlanningSettings, PlanningTask, EmployeeAvailability, EmployeeQualification, PlanningEvent)  # noqa: E402,F401

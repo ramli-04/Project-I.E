@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import api from './api/client';
 import BpmnCasePanel from './BpmnCasePanel';
-import { workstation, completed } from './api/contracts';
+import PlanningProgress from './PlanningProgress';
+import { workstation, completed, retryableRequest } from './api/contracts';
 import { ArrowRight, CheckCircle, Clock, Search, Save } from 'lucide-react';
 
 const methods = { CFAO: 'CFAO / usinage CNC', IMPRESSION_3D: 'Impression 3D', CONVENTIONNEL: 'Fabrication conventionnelle' };
@@ -55,6 +57,7 @@ export default function ProductionWorkflow({ orders, patchOrder, refresh }) {
 }
 
 export function ProductionCard({ order, patchOrder, refresh, diagram = false }) {
+  const advanceRequest = useRef(retryableRequest());
   const [method, setMethod] = useState(order.production_method || '');
   const [treatment, setTreatment] = useState(order.thermal_treatment || 'AUCUN');
   const [date, setDate] = useState(order.delivery_date || '');
@@ -92,8 +95,11 @@ export function ProductionCard({ order, patchOrder, refresh, diagram = false }) 
       if (planning) { payload.production_method = method; payload.thermal_treatment = method === 'CFAO' ? treatment : 'AUCUN'; }
     }
     if (['MANAGER', 'QUALITE'].includes(role) && order.intake_version < 2 && order.status === 'CONTROLE_QUALITE') payload.quality_validated = quality;
-    if (advance) payload.status = next;
-    try { await patchOrder(order.id, payload); setNotice('Enregistrement effectué.'); }
+    try {
+      if (advance) { await advanceRequest.current(api,`prescriptions/${order.id}/command/`,{action:'advance',data:payload}); await refresh?.(); }
+      else await patchOrder(order.id, payload);
+      setNotice('Enregistrement effectué.');
+    }
     catch (err) { setError(err.response?.data ? Object.values(err.response.data).flat().join(' ') : 'Enregistrement impossible. Vérifiez la connexion.'); }
     finally { setBusy(false); }
   }
@@ -124,6 +130,7 @@ export function ProductionCard({ order, patchOrder, refresh, diagram = false }) 
     {error && <p role="alert" className="rounded-xl bg-red-500/10 p-3 text-sm text-red-700">{error}</p>}{notice && <p role="status" className="text-sm text-emerald-700">{notice}</p>}
     <div className="flex flex-wrap justify-end gap-3"><button disabled={busy || !canWork} onClick={() => save(false)} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-600 disabled:opacity-50"><Save className="h-4 w-4" />Enregistrer les informations</button>{!courier && <button disabled={busy || !canAdvance} onClick={() => save(true)} className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-medium disabled:opacity-40"><ArrowRight className="h-4 w-4" />{busy ? 'Enregistrement…' : `Valider → ${nextLabel || 'Choisir la méthode'}`}</button>}{order.status === 'LIVRE' && <span className="flex items-center gap-2 text-sm text-emerald-700"><CheckCircle className="h-4 w-4" />Livraison terminée</span>}</div>
     <p className="text-xs text-slate-500">Échéance calculée : {order.deadline_at ? new Date(order.deadline_at).toLocaleString('fr-FR', { timeZone: 'Africa/Casablanca' }) : 'En cours de calcul'} · Temps de suspension : {order.deadline_suspended_seconds || 0} s{order.is_paused ? ' · Délai suspendu' : ''}</p>
+    <PlanningProgress order={order} refresh={refresh} />
     <BpmnCasePanel order={order} refresh={refresh} />
     <details><summary className="cursor-pointer text-xs text-slate-500">Historique des étapes ({order.workflow_history?.length || 0})</summary><ol className="mt-3 space-y-2 text-xs text-slate-500">{order.workflow_history?.map((event, index) => <li key={`${event.at}-${index}`}>{new Date(event.at).toLocaleString('fr-FR')} · {steps.find(step => step.key === event.status)?.label || event.status}</li>)}</ol></details>
   </article>;

@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import { LayoutGrid, ClipboardList, Wallet, Boxes, Activity, Settings2, PanelLeftClose, PanelLeftOpen, Menu, ArrowUpRight, HeartPulse } from 'lucide-react';
+import { LayoutGrid, ClipboardList, Wallet, Boxes, Activity, Settings2, CalendarDays, PanelLeftClose, PanelLeftOpen, Menu, ArrowUpRight, HeartPulse } from 'lucide-react';
 import SidebarLogo from './SidebarLogo';
 const navigation = [
   ['main', 'Vue d’ensemble', LayoutGrid], ['orders', 'Commandes', ClipboardList], ['inventory', 'Stocks et lots', Boxes],
+  ['planning', 'Planning', CalendarDays],
   ['billing', 'Facturation', Wallet], ['operations', 'Opérations', Activity], ['configuration', 'Configuration', Settings2],
 ];
 export default function LabAdminLayout({ section, onNavigate, accountMenu, children }) {

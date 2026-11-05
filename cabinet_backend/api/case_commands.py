@@ -76,6 +76,8 @@ def execute_case_command(order_id, command, data, actor, role, idempotency_key):
         key = uuid.UUID(str(idempotency_key))
     except (ValueError, TypeError, AttributeError) as exc:
         raise ValidationError('A UUID Idempotency-Key is required.') from exc
+    if not isinstance(data, dict) or not isinstance(command, str):
+        raise ValidationError('Provide a command name and an object payload.')
     digest = hashlib.sha256(json.dumps({'command': command, 'data': data}, sort_keys=True, default=str).encode()).hexdigest()
     with transaction.atomic():
         if command in {'confirm-delivery', 'rework', 'dispute', 'assess-loss'}:
@@ -108,6 +110,24 @@ def _execute(order, command, data, actor, role, metadata):
     # Update the context dictionary in place; the signal reads this same transaction's metadata.
     from .signals import _workflow_metadata
     metadata = _workflow_metadata.get()
+    if command == 'advance':
+        allowed(role, {'RECEPTION','CAO','FAO','QUALITE'})
+        from .planning import EXTERNAL
+        if 'status' in data or order.status in EXTERNAL or next_status(order) == 'VALIDATION_CAO':
+            raise ValidationError('Utilisez la commande métier spécialisée pour cette étape ; aucun statut arbitraire n’est accepté.')
+        target = next_status(order)
+        if not target:
+            raise ValidationError('Aucune étape suivante disponible.')
+        from .case_serializers import PrescriptionSerializer
+        serializer = PrescriptionSerializer(order, data={**{k:v for k,v in data.items() if k != 'notes'},
+            'action_notes':str(data.get('notes','')), 'status':target}, partial=True,
+            context={'command_role':role,'command_actor':actor,'command_action':'ADVANCE'})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return {'status':order.status}
+    if isinstance(command, str) and command.startswith('planning-'):
+        from .planning import task_command
+        return task_command(order, command, data, actor, role)
     if command == 'inspection':
         allowed(role, {'RECEPTION', 'QUALITE', 'CAO'})
         stage, checks = data.get('stage'), data.get('checks')

@@ -23,7 +23,7 @@ const sections = {
     description: 'Capacité de production et état de vos équipements.',
     fields: [
       { key: 'name', label: 'Nom', maxLength: 120 },
-      { key: 'machine_type', label: 'Type', options: [['SCANNER', 'Scanner'], ['USINEUSE_CNC', 'Usineuse CNC'], ['FOUR_FRITTAGE', 'Four de frittage']] },
+      { key: 'machine_type', label: 'Type', options: [['SCANNER', 'Scanner'], ['USINEUSE_CNC', 'Usineuse CNC'], ['FOUR_FRITTAGE', 'Four de frittage'], ['IMPRESSION_3D', 'Imprimante 3D']] },
       { key: 'capacity', label: 'Éléments simultanés', type: 'number', min: 1, step: 1 },
       { key: 'status', label: 'État', options: [['ACTIF', 'Actif'], ['MAINTENANCE', 'Maintenance'], ['PANNE', 'En panne']] },
     ],

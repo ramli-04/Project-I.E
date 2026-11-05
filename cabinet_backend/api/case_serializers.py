@@ -75,7 +75,11 @@ class PrescriptionSerializer(serializers.ModelSerializer):
         return obj.total_price is None
 
     def _audit_actor(self):
-        return actor_identity(self.context.get('request'))
+        return self.context.get('command_actor') or actor_identity(self.context.get('request'))
+
+    def _command_role(self):
+        request = self.context.get('request')
+        return self.context.get('command_role') or (actor_role(request) if request else 'SYSTEM')
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -87,7 +91,7 @@ class PrescriptionSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         request = self.context.get('request')
-        role = actor_role(request) if request else 'SYSTEM'
+        role = self._command_role()
         if self.instance is None:
             if attrs.get('disinfected') is not True:
                 raise serializers.ValidationError({'disinfected': 'Explicit disinfection confirmation is required.'})
@@ -153,7 +157,7 @@ class PrescriptionSerializer(serializers.ModelSerializer):
             validated_data['workflow_history'] = [*instance.workflow_history, {'status': validated_data['status'], 'at': timezone.now().isoformat()}]
         request = self.context.get('request')
         try:
-            with prescription_audit_context(self._audit_actor(), notes, {'role': actor_role(request) if request else 'SYSTEM'}):
+            with prescription_audit_context(self._audit_actor(), notes, {'role': self._command_role(), **({'action': self.context['command_action']} if 'command_action' in self.context else {})}):
                 return super().update(instance, validated_data)
         except DjangoValidationError as exc:
             raise serializers.ValidationError(getattr(exc, 'message_dict', exc.messages)) from exc

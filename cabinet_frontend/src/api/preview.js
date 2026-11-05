@@ -54,6 +54,8 @@ export async function previewAdapter(config) {
       let user; try { user = JSON.parse(sessionStorage.getItem('demo_user') || '{}'); } catch { user = {}; }
       data = envelope(user.role === 'Coursier' ? orders.filter(o => ['ATTENTE_RAMASSAGE','PRET_EXPEDITION'].includes(o.status)) : orders);
     } else if (path === 'inventory/') data = inventory;
+    else if (path === 'planning/workload/') data = { ...envelope([]),risks:[] };
+    else if (path.startsWith('planning/')) data = path === 'planning/settings/' ? [] : envelope([]);
     else if (path === 'employee-profiles/') data = [{ id: 1, user: 1, name: 'Youssef — Démonstration', role: 'CAO', contract_type: 'CDI', hire_date: '2026-01-05', is_available: true }, { id: 2, user: 2, name: 'Salma — Démonstration', role: 'QUALITE', contract_type: 'CDI', hire_date: '2026-02-02', is_available: true }];
     else if (path === 'partner-clinics/') data = [clinic];
     else if (path === 'production-lots/') data = envelope([{ id: 'demo-lot', code: 'LOT-DEMO-01', prescriptions: [orders[1].id], machine: 1, inventory_item: 1 }]);

@@ -66,14 +66,14 @@ test('paginated laboratory cases advance with only authorized fields', async ({ 
     if (path === '/api/prescriptions/' && req.method() === 'GET') return url.searchParams.get('page') === '1'
       ? { count: 2, next: 'http://labo1.localhost:8000/api/prescriptions/?page=2', results: [caseOrder()] }
       : { count: 2, next: null, results: [caseOrder({ id: 'd3f16d2a-4910-47cb-920d-8c1011539c02', patient_ref: 'PAT-PAGE2' })] };
-    if (req.method() === 'PATCH') { patch = req.postDataJSON(); return caseOrder(); }
+    if (path.endsWith('/command/')) { const command=req.postDataJSON(); expect(command.action).toBe('advance'); patch=command.data; return { case:caseOrder(), result:{} }; }
   });
   await page.goto('/static/'); await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
   await expect(page.getByText('PAT-PAGE2', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click();
   await page.getByLabel('Analyse de la demande validée').check();
   await page.getByRole('button', { name: 'Valider → Ramassage' }).click();
-  expect(patch.status).toBe('ATTENTE_RAMASSAGE'); expect(patch.analysis_validated).toBe(true);
+  expect(patch).not.toHaveProperty('status'); expect(patch.analysis_validated).toBe(true);
   expect(patch).not.toHaveProperty('is_paused'); expect(patch).not.toHaveProperty('quality_validated'); expect(errors).toEqual([]);
 });
 
@@ -239,4 +239,59 @@ test('laboratory identity, matching favicon and resource tabs with two-decimal q
   await page.getByLabel('Quantité initiale', { exact: false }).fill('3.45');
   await page.getByLabel('Quantité initiale', { exact: false }).press('6');
   await expect(page.getByLabel('Quantité initiale', { exact: false })).toHaveValue('3.45');
+});
+
+const planningTask=()=>({id:'a94eb25f-4910-47cb-920d-8c1011539c01',prescription:id,workflow_step:'SALLE_CAO',title:'Conception CAO',patient_ref:'PAT-TEST',assigned_employee:1,employee_name:'Technicien CAO',required_role:'CAO',status:'READY',planned_start:'2026-11-09T07:00:00Z',planned_end:'2026-11-09T08:00:00Z',deadline:'2026-11-13T17:00:00Z',estimated_duration_minutes:60,production_attempt:1,sequence:10,generation:1,dependencies:[],locked:false,can_operate:true,external:false,source_status:'SALLE_CAO',assignment_explanation:{score:0.8,components:{qualification:1,workload:0.5}}});
+async function planningMocks(page,handler){
+  const task=planningTask();
+  await mocks(page,async(path,req,url)=>{
+    const override=await handler?.(path,req,url,task);if(override!==undefined)return override;
+    if(path==='/api/prescriptions/')return {results:[caseOrder({status:'SALLE_CAO',status_label:'Conception CAO'})],next:null};
+    if(path==='/api/employee-profiles/')return [{id:1,user:1,name:'Technicien CAO',role:'CAO',is_available:true}];
+    if(path==='/api/planning/tasks/'||path==='/api/planning/calendar/')return {count:1,results:[task],next:null};
+    if(path==='/api/planning/workload/')return {count:1,results:[{employee:1,name:'Technicien CAO',role:'CAO',available:true,available_minutes:540,planned_minutes:60,utilization:11.11}],risks:[]};
+    if(path==='/api/planning/settings/')return {timezone:{zone:'Africa/Casablanca',until:'2027-01-01T00:00:00Z',transitions:[{at:'2026-10-01T00:00:00Z',offset:60}]},working_days:[0,1,2,3,4],open_time:'08:00',close_time:'18:00',break_start:'12:00',break_end:'13:00',horizon_days:28,weights:{qualification:30,availability:25,workload:20,urgency:15,continuity:10},step_rules:{},defaults:{SALLE_CAO:{title:'Conception CAO',role:'CAO',duration:60,machine_type:'',qualifications:[]}}};
+  });
+}
+test('planning calendar, Gantt and workload display backend tasks and filters',async({page})=>{
+  await session(page);const queries=[];
+  await planningMocks(page,(path,req,url)=>{if(path==='/api/planning/tasks/'||path==='/api/planning/calendar/')queries.push(Object.fromEntries(url.searchParams));});
+  await page.goto('/static/');await page.getByRole('button',{name:'Planning',exact:true}).click();
+  await page.getByLabel('Date du planning').fill('2026-11-09');
+  await expect(page.getByTitle('PAT-TEST · Conception CAO · Technicien CAO',{exact:true})).toBeVisible();
+  await page.getByLabel('Employé',{exact:true}).selectOption('1');
+  await expect.poll(()=>queries.some(q=>q.employee==='1')).toBe(true);
+  await expect(page.locator('.planning-time-block small')).toContainText('08:00');
+  await page.screenshot({path:'../.runtime/planning-calendar-desktop.png',fullPage:true});
+  await page.getByRole('button',{name:'Gantt',exact:true}).click();await expect(page.locator('.planning-gantt-bar')).toBeVisible();
+  await page.getByRole('button',{name:'Charge',exact:true}).click();await expect(page.getByRole('cell',{name:'11.11 %',exact:true})).toBeVisible();
+  await page.setViewportSize({width:390,height:844});
+  await expect(page.getByRole('heading',{name:'Planning de fabrication'})).toBeVisible();
+  await expect.poll(()=>page.locator('.clinical-sidebar').evaluate(el=>el.getBoundingClientRect().right)).toBeLessThanOrEqual(0);
+  await page.locator('.planning-workload-table').scrollIntoViewIfNeeded();
+  await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+  await page.screenshot({path:'../.runtime/planning-workload-mobile.png',fullPage:true});
+});
+test('supervised planning assignment carries UUID and reports an API conflict',async({page})=>{
+  await session(page);let payload;let key;
+  await planningMocks(page);
+  await page.route('**/api/planning/tasks/*/assign/',async route=>{payload=route.request().postDataJSON();key=route.request().headers()['idempotency-key'];await route.fulfill({status:400,json:{detail:'Conflit de réservation : employé déjà occupé.'},headers:{'Access-Control-Allow-Origin':'*'}});});
+  await page.goto('/static/');await page.getByRole('button',{name:'Planning',exact:true}).click();await page.getByLabel('Date du planning').fill('2026-11-09');
+  await page.getByTitle('PAT-TEST · Conception CAO · Technicien CAO',{exact:true}).click();
+  await page.getByRole('button',{name:'Affecter et verrouiller',exact:true}).click();
+  await expect(page.getByRole('alert')).toContainText('Conflit de réservation');
+  expect(payload.employee).toBe(1);expect(payload.start).toBe('2026-11-09T07:00:00.000Z');expect(key).toMatch(/^[0-9a-f-]{36}$/);
+});
+test('manufacturing task start and completion use existing case-command endpoint',async({page})=>{
+  await session(page);const calls=[];
+  await planningMocks(page,(path,req,url,task)=>{
+    if(path.endsWith('/command/')&&req.method()==='POST'){
+      const payload=req.postDataJSON();calls.push(payload);
+      task.status=payload.action==='planning-start'?'IN_PROGRESS':'COMPLETED';
+      return {case:caseOrder(),result:{task_id:task.id,status:task.status}};
+    }
+  });
+  await page.goto('/static/');await page.getByRole('button',{name:'Commandes',exact:true}).first().click();await page.getByRole('button',{name:'Ouvrir le diagramme PAT-TEST'}).click();
+  await page.getByRole('button',{name:'Démarrer',exact:true}).click();await page.getByRole('button',{name:'Terminer l’étape',exact:true}).click();
+  await expect.poll(()=>calls.length).toBe(2);expect(calls.map(c=>c.action)).toEqual(['planning-start','planning-complete']);expect(calls[0].data.task).toBe(planningTask().id);
 });

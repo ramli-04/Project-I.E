@@ -10,9 +10,30 @@ from copy import copy
 
 
 class EmployeeProfileSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField()
+
+    def get_name(self,obj):
+        from .planning import employee_name
+        return employee_name(obj)
+
+    def validate_platform_account(self,value):
+        if value is not None:
+            request=self.context.get('request')
+            if request is None or value.laboratory_id != request.tenant.pk or value.role not in {'LAB','COURIER'} or not value.is_active:
+                raise serializers.ValidationError('Choisissez un compte actif de ce laboratoire.')
+        return value
+
+    def validate(self,attrs):
+        account=attrs.get('platform_account',getattr(self.instance,'platform_account',None))
+        role=attrs.get('role',getattr(self.instance,'role',None))
+        if account:
+            account_role=account.workstation_role if account.role=='LAB' else 'COURSIER'
+            if account_role not in {role,'MANAGER'}:
+                raise serializers.ValidationError('Le poste du compte doit correspondre au rôle du collaborateur.')
+        return attrs
     class Meta:
         model = EmployeeProfile
-        fields = ['id', 'user', 'role', 'contract_type', 'hire_date', 'is_available']
+        fields = ['id', 'user', 'platform_account', 'name', 'role', 'contract_type', 'hire_date', 'is_available']
         read_only_fields = ['id']
 
 

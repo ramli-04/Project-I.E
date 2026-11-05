@@ -83,6 +83,30 @@ def complete_event(event):
 
 
 @shared_task(base=DurableTenantTask, autoretry_for=(DatabaseError,), retry_backoff=True, max_retries=3,
+             acks_late=True, reject_on_worker_lost=True, soft_time_limit=270, time_limit=300)
+def recalculate_planning_task(tenant_schema_name, prescription_id, outbox_id=None):
+    from .planning import configuration, lock_planning, recalculate, sync_order
+    from .planning_models import PlanningSettings
+    from django.db.models import F
+    tenant = active_tenant(tenant_schema_name)
+    with tenant_context(tenant), transaction.atomic():
+        # Same lock order as source writes: source before the planning lock.
+        order = Prescription.objects.select_for_update().get(pk=prescription_id)
+        lock_planning()
+        event = locked_event(outbox_id, prescription_id, 'PLANNING')
+        if event and event.processed_at:
+            return {'status': 'ALREADY_PROCESSED'}
+        before = list(order.planning_tasks.values_list('pk','status'))
+        sync_order(order)
+        if before != list(order.planning_tasks.values_list('pk','status')):
+            PlanningSettings.objects.filter(pk=1).update(revision=F('revision')+1)
+        settings = configuration()
+        result = recalculate() if settings.applied_revision < settings.revision else {'status':'UP_TO_DATE'}
+        complete_event(event)
+        return result
+
+
+@shared_task(base=DurableTenantTask, autoretry_for=(DatabaseError,), retry_backoff=True, max_retries=3,
              acks_late=True, reject_on_worker_lost=True, soft_time_limit=50, time_limit=60)
 def calculate_automatic_calendar_task(tenant_schema_name, prescription_id, outbox_id=None):
     tenant = active_tenant(tenant_schema_name)

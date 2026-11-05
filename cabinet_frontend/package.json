@@ -8,7 +8,7 @@
     "demo": "vite --mode demo --host 127.0.0.1 --port 5174",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test src/api/contracts.test.js",
+    "test": "node --test src/api/contracts.test.js src/planningTime.test.js",
     "test:browser": "playwright test",
     "preview": "vite preview"
   },

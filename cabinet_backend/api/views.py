@@ -12,6 +12,7 @@ from .permissions import DemoTenantPermission, LaboratoryResourcePermission
 from .permissions import PrescriptionPermission, actor_role
 from .case_serializers import CourierPrescriptionSerializer, actor_identity
 from .business_views import BusinessPagination, translate_error
+from .planning_views import ResourcePlanningMixin
 from rest_framework.decorators import action
 from django.core.exceptions import ValidationError as DjangoValidationError
 from decimal import InvalidOperation
@@ -27,13 +28,13 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
-class EmployeeProfileViewSet(viewsets.ModelViewSet):
+class EmployeeProfileViewSet(ResourcePlanningMixin, viewsets.ModelViewSet):
     permission_classes = [LaboratoryResourcePermission]
-    queryset = EmployeeProfile.objects.all()
+    queryset = EmployeeProfile.objects.select_related('user','platform_account').all()
     serializer_class = EmployeeProfileSerializer
 
 
-class MachineViewSet(viewsets.ModelViewSet):
+class MachineViewSet(ResourcePlanningMixin, viewsets.ModelViewSet):
     write_roles = {'MANAGER', 'FAO'}
     permission_classes = [LaboratoryResourcePermission]
     queryset = Machine.objects.all()

@@ -20,6 +20,7 @@ import CourierPortal from './CourierPortal';
 import FinanceDashboard from './FinanceDashboard';
 import InventoryWorkspace from './InventoryWorkspace';
 import OperationsDashboard from './OperationsDashboard';
+import PlanningWorkspace from './PlanningWorkspace';
 import { allRows, errorText, workstation } from './api/contracts';
 import { Feedback, Button } from './IntegrationUI';
 import SidebarLogo from './SidebarLogo';
@@ -204,6 +205,7 @@ function LabPortal({ section, orders, refresh, activeTab, setActiveTab, configTa
   const role = workstation();
   if (section === 'configuration') return <LabBusinessConfiguration key={configTarget?.request || 'configuration'} target={configTarget} />;
   if (section === 'inventory') return <InventoryWorkspace orders={orders} />;
+  if (section === 'planning') return <PlanningWorkspace orders={orders} refreshOrders={refresh} />;
   if (section === 'operations') return role === 'MANAGER' ? <OperationsDashboard /> : <p>Accès responsable requis.</p>;
   if (section === 'orders') return <OrderManagement orders={orders} patchOrder={patchOrder} refresh={refresh} />;
   if (section === 'billing') return ['MANAGER','COMPTABILITE'].includes(role) ? <FinanceDashboard /> : <p>Accès comptabilité requis.</p>;

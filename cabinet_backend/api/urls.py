@@ -8,8 +8,14 @@ from .analytics_views import MonthlyStatementCatalogViewSet, MonthlyFinancialCat
 from .views import InventoryTransactionViewSet
 from .business_views import (ProductionLotViewSet, BillingPeriodViewSet, StatementLineViewSet,
     FinanceInvoiceViewSet, BillingDisputeViewSet, OutboxViewSet, MessageDeliveryViewSet, CreditNoteViewSet)
+from .planning_views import (PlanningTaskViewSet, PlanningEventViewSet, AvailabilityViewSet, QualificationViewSet,
+    planning_settings, workload_view, recalculate_view, planning_accounts)
 
 router = DefaultRouter()
+router.register(r'planning/tasks', PlanningTaskViewSet, basename='planning-task')
+router.register(r'planning/events', PlanningEventViewSet, basename='planning-event')
+router.register(r'planning/availability', AvailabilityViewSet, basename='planning-availability')
+router.register(r'planning/qualifications', QualificationViewSet, basename='planning-qualification')
 router.register(r"prescriptions", PrescriptionViewSet, basename="prescription")
 router.register(r"staff", StaffMemberViewSet, basename="staff")
 router.register(r"equipment", EquipmentViewSet, basename="equipment")
@@ -34,6 +40,11 @@ router.register(r'analytics/monthly-statements', MonthlyStatementCatalogViewSet,
 router.register(r'analytics/monthly-finances', MonthlyFinancialCatalogViewSet, basename='monthly-financial-catalog')
 
 urlpatterns = [
+    path('planning/accounts/', planning_accounts, name='planning-accounts'),
+    path('planning/calendar/', PlanningTaskViewSet.as_view({'get':'list'}), name='planning-calendar'),
+    path('planning/workload/', workload_view, name='planning-workload'),
+    path('planning/settings/', planning_settings, name='planning-settings'),
+    path('planning/recalculate/', recalculate_view, name='planning-recalculate'),
     path('alerts/', alerts_view, name='laboratory-alerts'),
     path("", include(router.urls)),
 ]

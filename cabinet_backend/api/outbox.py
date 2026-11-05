@@ -12,6 +12,7 @@ from .models import TaskOutbox
 
 logger = logging.getLogger(__name__)
 TASKS = {
+    'PLANNING': 'api.tasks.recalculate_planning_task',
     'CALENDAR': 'api.tasks.calculate_automatic_calendar_task',
     'INVOICE': 'api.tasks.generate_invoice_pdf_task',
     'CACHE': 'api.tasks.invalidate_active_orders_task',
