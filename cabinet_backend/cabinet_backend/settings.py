@@ -49,6 +49,7 @@ SHARED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.postgres",
     "rest_framework",
     "corsheaders",
 ]
@@ -81,6 +82,7 @@ MIDDLEWARE = [
 
 # ---------- CORS (dev only — allow everything) ----------
 CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = [value for value in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if value]
 CORS_ALLOWED_ORIGIN_REGEXES = [r'^http://([a-z0-9-]+\.)?localhost:(5173|4173|8000)$']
 CORS_ALLOW_METHODS = [
     "DELETE",
@@ -160,6 +162,9 @@ PRIVATE_MEDIA_ROOT = Path(os.environ.get('PRIVATE_MEDIA_ROOT', BASE_DIR.parent /
 DATA_UPLOAD_MAX_MEMORY_SIZE = 30 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
 EXTERNAL_DELIVERY_ENABLED = os.environ.get('EXTERNAL_DELIVERY_ENABLED', '0') == '1'
+CABINET_SIMULATION = os.environ.get('CABINET_SIMULATION', '0') == '1'
+if CABINET_SIMULATION:
+    EXTERNAL_DELIVERY_ENABLED = False
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
@@ -189,7 +194,7 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
     'visibility_timeout': 3600, 'max_retries': 0,
 }
 CELERY_TASK_PUBLISH_RETRY = False
-OUTBOX_PUBLISH_ON_COMMIT = True
+OUTBOX_PUBLISH_ON_COMMIT = os.environ.get('OUTBOX_PUBLISH_ON_COMMIT', '1') == '1'
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_BEAT_SCHEDULE = {
     'recover-pending-business-events': {

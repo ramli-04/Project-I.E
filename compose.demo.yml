@@ -1,0 +1,108 @@
+name: cabinet-virtual-lab
+
+# Dedicated synthetic environment. Never mounts the Windows database/private files.
+x-backend: &backend
+  build:
+    context: ./cabinet_backend
+  environment: &environment
+    DJANGO_SETTINGS_MODULE: cabinet_backend.settings
+    DJANGO_ALLOWED_HOSTS: .localhost,127.0.0.1,backend,bootstrap
+    DJANGO_DEBUG: "0"
+    CABINET_SIMULATION: "1"
+    CORS_ALLOWED_ORIGINS: http://localhost:18080,http://127.0.0.1:18080
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: cabinet_demo
+    POSTGRES_USER: cabinet_demo
+    POSTGRES_PASSWORD: local-synthetic-demo-only
+    POSTGRES_PORT: "5432"
+    DJANGO_SECRET_KEY_FILE: /demo/runtime/signing-key
+    PRIVATE_MEDIA_ROOT: /demo/media
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    REDIS_CACHE_URL: redis://redis:6379/2
+    EXTERNAL_DELIVERY_ENABLED: "0"
+    DEMO_ACCOUNT_PASSWORD: Demo-Lab-2026!
+  volumes:
+    - demo_runtime:/demo
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: cabinet_demo
+      POSTGRES_USER: cabinet_demo
+      POSTGRES_PASSWORD: local-synthetic-demo-only
+    volumes:
+      - demo_postgres:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U cabinet_demo -d cabinet_demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:alpine
+    command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction]
+    volumes:
+      - demo_redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  bootstrap:
+    <<: *backend
+    environment:
+      <<: *environment
+      OUTBOX_PUBLISH_ON_COMMIT: "0"
+    command: [python, demo_bootstrap.py]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  backend:
+    <<: *backend
+    command: [waitress-serve, --listen=0.0.0.0:8000, cabinet_backend.wsgi:application]
+    ports:
+      - "127.0.0.1:18000:8000"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/platform/environment/', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  celery_worker:
+    <<: *backend
+    command: [celery, -A, cabinet_backend.celery:app, worker, --loglevel=INFO, --concurrency=2]
+    stop_grace_period: 60s
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  celery_beat:
+    <<: *backend
+    command: [celery, -A, cabinet_backend.celery:app, beat, --loglevel=INFO, --schedule=/demo/celerybeat-schedule]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: ./cabinet_frontend
+      dockerfile: Dockerfile.demo
+    ports:
+      - "127.0.0.1:18080:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  demo_postgres:
+  demo_redis:
+  demo_runtime:

@@ -10,6 +10,8 @@ The project was previously called **Cabinet 2.0**. Existing directory names and 
 
 ## Quick start: preview without a database
 
+For an isolated Docker environment using the **real Django/PostgreSQL API** and synthetic fixtures, see [DEMO_GUIDE.md](DEMO_GUIDE.md) and [VIRTUAL_LAB_PLAN.md](VIRTUAL_LAB_PLAN.md). The first milestone establishes reproducible setup; connected virtual-machine events and separate human/machine scheduling follow in later steps.
+
 Requires Node.js and npm. From the repository root:
 
 ```powershell

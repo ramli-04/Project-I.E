@@ -1,7 +1,9 @@
 from django.urls import path
 from . import views
+from .environment import environment_info
 
 urlpatterns = [
+    path('environment/', environment_info),
     path('login/', views.demo_login), path('logout/', views.demo_logout),
     path('laboratories/', views.laboratories),
     path('accounts/', views.accounts), path('accounts/<int:account_id>/', views.accounts),
