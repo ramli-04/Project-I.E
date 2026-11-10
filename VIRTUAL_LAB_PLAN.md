@@ -2,6 +2,8 @@
 
 Branch: `feat/virtual-lab-demo`. Shared production features remain in the main Django application; simulator-specific setup runs in a separate Compose project.
 
+Paused checkpoint, 10 November2026: read `RESUME_VIRTUAL_LAB.md` first. Two live-browser blockers (CORS idempotency header and combined production-route selection) must be fixed before Step3. Work is saved locally; publishing is deferred at the user's request. See `DEMO_TEST_RESULTS.md` for evidence.
+
 ## Step 1 — architecture inspection (complete)
 
 Graphify identified the existing tenant-aware workflow, planning reservations, qualifications, availability and durable outbox. The current scheduler reserves an employee for an entire equipment cycle. Its frontend `npm run demo` uses mocked browser responses and cannot prove backend behavior.
