@@ -100,7 +100,7 @@ class BPMNAcceptanceTests(TenantTestCase):
         self.assertEqual(response.status_code, 201, response.data)
         return response.data['id']
 
-    def to_cao(self, order):
+    def to_planning(self, order):
         self.patch(order, accepted=True)
         self.patch(order, status='ANALYSE_DEMANDE')
         if order.impression_type == 'PHYSIQUE':
@@ -119,6 +119,9 @@ class BPMNAcceptanceTests(TenantTestCase):
             self.patch(order, status='CONTROLE_MODELE')
             self.command(order, 'inspection', {'stage': 'MODEL', 'checks': {'model': True, 'scan': True}})
         self.patch(order, status='PLANIFICATION')
+
+    def to_cao(self, order):
+        self.to_planning(order)
         self.patch(order, status='SALLE_CAO', production_method='CFAO', delivery_date='2026-10-30')
 
     def to_quality(self, order):
@@ -130,12 +133,12 @@ class BPMNAcceptanceTests(TenantTestCase):
         self.patch(order, status='FINITION')
         self.patch(order, status='CONTROLE_QUALITE')
 
-    def deliver(self, order):
+    def deliver(self, order, *, recipient=None):
         self.command(order, 'inspection', {'stage': 'QUALITY', 'checks': dict.fromkeys(['margins','contacts','shade','occlusion','cosmetic','glazing','polishing'], True)})
         self.patch(order, status='CONDITIONNEMENT')
         self.patch(order, status='PRET_EXPEDITION')
         self.command(order, 'checkout', {'qr_token': qr_token(order)}, user=self.courier)
-        self.command(order, 'confirm-delivery', {'pin': order._test_pin}, user=self.courier)
+        self.command(order, 'confirm-delivery', {'pin': order._test_pin}, user=recipient or self.courier)
 
     def test_missing_password_unknown_token_and_cross_tenant_access_are_denied(self):
         self.client.force_authenticate(user=None)
@@ -310,6 +313,96 @@ class BPMNAcceptanceTests(TenantTestCase):
             self.assertEqual(self.client.get('/api/prescriptions/').status_code, 200)
         result = self.client.get('/api/prescriptions/')
         self.assertEqual(result.data['results'][0]['status'], 'ANALYSE_DEMANDE')
+
+    def verify_complete_delivery_and_billing(self, track):
+        """Real API/domain/SQL guards; historical clock only in the test database."""
+        from .workflow import workflow_steps
+        created=[]
+        october=datetime(2026,10,10,12,tzinfo=utc_timezone.utc)
+        with patch('django.utils.timezone.now',return_value=october):
+            for route in ('CFAO','IMPRESSION_3D','CONVENTIONNEL'):
+                with self.subTest(track=track,route=route):
+                    order=self.new_case(impression_type=track,delivery_service='EXPRESS',
+                        design_validation_requested=route!='CONVENTIONNEL')
+                    self.to_planning(order)
+                    self.command(order,'advance',{'production_method':route,'delivery_date':'2026-10-14',
+                        'thermal_treatment':'FRITTAGE' if route=='CFAO' else 'AUCUN'})
+                    lot=self.client.post('/api/production-lots/',{'code':'FLOW-'+order.pk.hex,
+                        'prescriptions':[str(order.pk)]},format='json')
+                    self.assertEqual(lot.status_code,201,lot.data)
+                    if order.design_validation_requested:
+                        design=self.upload(order,'DESIGN')
+                        self.command(order,'design-request',{'attachment':design})
+                        self.assertTrue(order.is_paused)
+                        review=order.design_reviews.get()
+                        self.command(order,'design-decision',{'review':str(review.pk),'decision':'APPROVED'},user=self.dentist)
+                        self.assertFalse(order.is_paused)
+                    for _ in range(12):
+                        if order.status=='CONTROLE_QUALITE': break
+                        self.command(order,'advance')
+                    self.assertEqual(order.status,'CONTROLE_QUALITE')
+                    self.deliver(order,recipient=self.dentist)
+                    self.command(order,'fitting',{'passed':True},user=self.dentist)
+                    self.assertEqual(order.status,'CLOTURE')
+                    statuses=list(order.audit_history.order_by('created_at','pk').values_list('new_status',flat=True))
+                    for step in workflow_steps(order):
+                        if step['key'] not in {'DEMANDE_RECUE','ESSAYAGE'}:
+                            self.assertIn(step['key'],statuses)
+                    self.assertEqual(order.statement_line.period.month.isoformat(),'2026-10-01')
+                    self.assertEqual(order.statement_line.base_amount,Decimal('1200'))
+                    self.assertEqual(order.statement_line.express_surcharge,Decimal('360'))
+                    created.append(order)
+            period=created[0].statement_line.period
+            premature=self.client.post(f'/api/billing/periods/{period.pk}/close/',{},format='json')
+            self.assertEqual(premature.status_code,400,premature.data)
+        with patch('django.utils.timezone.now',return_value=datetime(2026,11,15,12,tzinfo=utc_timezone.utc)):
+            closed=self.client.post(f'/api/billing/periods/{period.pk}/close/',{},format='json')
+            self.assertEqual(closed.status_code,200,closed.data)
+            repeated=self.client.post(f'/api/billing/periods/{period.pk}/close/',{},format='json')
+            self.assertEqual(repeated.status_code,200,repeated.data)
+            self.assertEqual(closed.data['id'],repeated.data['id'])
+        invoice=FinanceInvoice.objects.get(pk=closed.data['id'])
+        self.assertEqual(invoice.total_amount,Decimal('4680'))
+        self.assertEqual(len(invoice.lines),3)
+        events=TaskOutbox.objects.filter(event_type='INVOICE',prescription_id__in=[order.pk for order in created])
+        self.assertEqual(events.count(),3)
+        for event in events:
+            generated=generate_invoice_pdf_task(self.tenant.schema_name,str(event.prescription_id),str(event.pk))
+            self.assertEqual(generated['status'],'PDF_READY')
+        self.assertEqual(InvoiceDocument.objects.filter(invoice=invoice).count(),1)
+        pdf=self.client.get(f'/api/billing/invoices/{invoice.pk}/pdf/')
+        self.assertEqual(pdf.status_code,200)
+        self.assertTrue(b''.join(pdf.streaming_content).startswith(b'%PDF-'))
+        refresh_billing_catalog(self.tenant.schema_name)
+        self.assertEqual(MonthlyFinancialCatalog.objects.get().net_amount,Decimal('4680'))
+
+    def test_complete_physical_routes_through_delivery_and_monthly_invoice(self):
+        self.verify_complete_delivery_and_billing('PHYSIQUE')
+
+    def test_complete_digital_routes_through_delivery_and_monthly_invoice(self):
+        self.verify_complete_delivery_and_billing('NUMERIQUE')
+
+    def test_dentist_delivery_confirmation_requires_ownership_and_correct_pin(self):
+        order=self.new_case()
+        self.to_cao(order);self.to_quality(order)
+        self.command(order,'inspection',{'stage':'QUALITY','checks':dict.fromkeys(
+            ['margins','contacts','shade','occlusion','cosmetic','glazing','polishing'],True)})
+        self.patch(order,status='CONDITIONNEMENT');self.patch(order,status='PRET_EXPEDITION')
+        self.command(order,'checkout',{'qr_token':qr_token(order)},user=self.courier)
+        with schema_context('public'):
+            stranger=PlatformAccount.objects.create(name='Other dentist',login_key='other-dentist',role='DENTIST')
+        self.command(order,'confirm-delivery',{'pin':order._test_pin},user=stranger,expected=404)
+        self.assertEqual(order.status,'EN_ROUTE_CABINET')
+        wrong='0000' if order._test_pin!='0000' else '1111'
+        self.command(order,'confirm-delivery',{'pin':wrong},user=self.dentist,expected=400)
+        self.assertEqual(order.pin_attempts,1)
+        self.assertFalse(hasattr(order,'statement_line'))
+        key=uuid.uuid4()
+        self.command(order,'confirm-delivery',{'pin':order._test_pin},user=self.dentist,key=key)
+        self.command(order,'confirm-delivery',{'pin':order._test_pin},user=self.dentist,key=key)
+        self.assertEqual(order.status,'LIVRE')
+        from .models import StatementLine
+        self.assertEqual(StatementLine.objects.filter(prescription=order).count(),1)
 
     def test_monthly_closing_real_pdf_and_credit_catalog(self):
         october = datetime(2026,10,10,12,tzinfo=utc_timezone.utc)

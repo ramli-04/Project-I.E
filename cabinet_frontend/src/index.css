@@ -9,6 +9,24 @@
 }
 :root { font-family: var(--font-sans); color: #242b2b; background: #f6f7f9; font-synthesis: none; -webkit-font-smoothing: antialiased; }
 body { margin: 0; }
+.app-notification { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 100; display: flex; align-items: start; gap: 16px; width: max-content; max-width: min(640px, calc(100vw - 24px)); max-height: 25dvh; overflow: auto; padding: 14px 18px; border: 1px solid #a4cabc; border-radius: 14px; background: #effaf5; color: #145c42; box-shadow: 0 8px 32px #17362930; font-size: 14px; }
+.app-notification.error { color: #9b1c27; border-color: #edb5bc; background: #fff1f3; }
+.app-notification button { flex-shrink: 0; font-size: 20px; line-height: 1; }
+.action-dialog { position: fixed; inset: 0; margin: auto; padding: 0; width: min(960px, calc(100vw - 24px)); max-width: 100%; max-height: calc(100dvh - 24px); border: 1px solid #dce6e0; border-radius: 20px; background: #f8faf9; color: #242b2b; box-shadow: 0 20px 80px #17362944; }
+.action-dialog::backdrop { background: #17362966; backdrop-filter: blur(4px); }
+.action-dialog-header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 22px; background: #f8faf9; border-bottom: 1px solid #dce6e0; }
+.action-dialog-header h2 { font-size: 18px; font-weight: 600; overflow-wrap: anywhere; }
+.action-dialog-header button { flex-shrink: 0; padding: 8px; color: #256e65; }
+.action-dialog-content { padding: 20px; }
+.clinical-dialog-tabs { position: sticky; top: 72px; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin: -4px -4px 16px; padding: 8px 4px; background: #f8faf9; }
+.clinical-dialog-tabs button[aria-selected=true] { background: #2d8076; color: white; }
+@media (max-width:650px) {
+  .action-dialog-header { padding: 14px; }
+  .action-dialog-header h2 { font-size: 16px; }
+  .action-dialog-content { padding: 14px; }
+  .clinical-dialog-tabs { position: static; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .clinical-dialog-tabs button { padding: 8px 5px; font-size: 12px; overflow-wrap: anywhere; }
+}
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: default; }
@@ -54,11 +72,14 @@ input:focus,textarea:focus,select:focus { border-color: #82b9ad; box-shadow: 0 0
 .sidebar-footer strong { display: block; font-size: 10px; font-weight: 500; }.sidebar-footer small { display: block; font-size: 8px; color: #969e9a; margin-top: 3px; }
 .sidebar-footer button { color: #8a9691; margin-left: auto; padding: 2px; }
 .clinical-body { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
-.clinical-header { display: flex; align-items: center; justify-content: space-between; padding: 23px 15px 18px 2px; min-height: 110px; gap: 15px; }
+.clinical-header { position: relative; z-index: 30; flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 23px 15px 18px 2px; min-height: 110px; gap: 15px; }
+.header-heading, .header-heading > div { min-width: 0; }
+.header-actions { flex-shrink: 0; flex-wrap: wrap; max-width: 100%; }
+#account-panel { z-index: 1; max-height: calc(100dvh - 12rem); overflow-y: auto; overscroll-behavior: contain; }
 .header-breadcrumb { font-size: 8px; color: #899692; font-weight: 500; letter-spacing: 1.3px; }.header-breadcrumb span { margin: 0 7px; opacity: .5; }
 .header-heading { display: flex; align-items: center; gap: 12px; }.header-heading h1 { font-size: 25px; line-height: 1.35; font-weight: 600; letter-spacing: -.9px; margin-top: 6px; display: flex; align-items: center; gap: 11px; }.heading-dot { width: 6px; height: 6px; border-radius: 50%; background: #2d8076; }.header-heading p { font-size: 11px; color: #919b97; margin-top: 6px; }
 .header-actions { display: flex; gap: 12px; align-items: center; }.header-actions button { font-size: 11px; }.header-actions .report-button { display: flex; gap: 7px; align-items: center; border-radius: 7px; background: #2d8076; color: white; padding: 11px 15px; box-shadow: 0 4px 10px #2d807610; }.report-button:hover { background: #21685f; transform: translateY(-2px); }
-.clinical-main { min-height: 0; flex: 1; overflow: auto; padding: 0 14px 15px 0; outline: none; }
+.clinical-main { position: relative; z-index: 0; min-height: 0; flex: 1; overflow: auto; padding: 0 14px 15px 0; outline: none; }
 .orders-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-bottom: 7px; font-size: 10px; }
 .orders-toolbar button { border: 0; background: transparent; color: #7a8b83; padding: 2px 0; font-size: 10px; }
 .orders-toolbar [role=alert] { margin-right: auto; }.orders-toolbar button:hover { color: #2d8076; }

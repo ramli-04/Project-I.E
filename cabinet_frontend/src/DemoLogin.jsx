@@ -1,6 +1,8 @@
 ﻿import { useEffect, useState } from 'react';
 import { ArrowRight } from 'lucide-react';
 import platform from './api/platform';
+import { errorText } from './api/contracts';
+import { Feedback } from './IntegrationUI';
 import { useTenant } from './contexts/useTenant';
 import SidebarLogo from './SidebarLogo';
 import { DentalTooth } from './ClinicalDashboard';
@@ -49,7 +51,7 @@ export default function DemoLogin({ setUser }) {
       }
       sessionStorage.setItem('demo_user', JSON.stringify(user)); setUser(user);
     } catch (err) {
-      setError(err.response?.data?.detail || (portal === 'COURIER' ? err.message : 'Connexion impossible. Vérifiez votre identification, l’espace choisi et la connexion au serveur.'));
+      setError(errorText(err));
     } finally { setBusy(false); }
   }
 
@@ -64,7 +66,7 @@ export default function DemoLogin({ setUser }) {
       <label htmlFor="login-name" className="block text-sm text-slate-600">{portal === 'COURIER' ? 'Nom du coursier' : 'Votre identification'}<input id="login-name" autoComplete="username" required maxLength={150} pattern=".*\S.*" value={name} onChange={event => setName(event.target.value)} placeholder={portal === 'LAB' || portal === 'COURIER' ? 'Mohamed' : portal === 'DENTIST' ? 'Dentiste 1' : 'Admin'} className={inputClass} />{portal === 'LAB' && <span className="mt-2 block text-xs text-slate-500">Exemple : sélectionnez Labo 1 et saisissez simplement Mohamed.</span>}</label>
       <label htmlFor="login-password" className="block text-sm text-slate-600">Mot de passe<input id="login-password" type="password" autoComplete="current-password" required maxLength={256} value={password} onChange={event => setPassword(event.target.value)} className={inputClass} /></label>
     </fieldset>
-    {error && <p role="alert" className="rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-700">{error}</p>}
+    <Feedback error={error || labError} />
     <button disabled={busy || (needsLab && (loadingLabs || Boolean(labError) || !laboratory))} className="flex w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 py-3 font-medium hover:bg-teal-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 disabled:opacity-50">{busy ? 'Connexion…' : 'Accéder à mon espace'}<ArrowRight aria-hidden="true" className="h-4 w-4" /></button></form>
     <p className="mt-6 text-xs leading-relaxed text-slate-500">Accès personnel sécurisé. Pour obtenir un compte ou réinitialiser votre mot de passe, contactez l’administration.</p>
   </section></div>;

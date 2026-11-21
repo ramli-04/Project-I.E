@@ -24,10 +24,11 @@ import PlanningWorkspace from './PlanningWorkspace';
 import { allRows, errorText, workstation } from './api/contracts';
 import { Feedback, Button } from './IntegrationUI';
 import SidebarLogo from './SidebarLogo';
+import NotificationCenter from './NotificationCenter';
 import { previewMode } from './api/preview';
 
 export default function App() {
-  return <>{previewMode && <div role="status" className="fixed bottom-2 left-1/2 z-50 w-max max-w-[95vw] -translate-x-1/2 rounded-xl border border-amber-400/40 bg-white px-4 py-2 text-center text-xs text-amber-800">Aperçu sans base de données · données fictives · lecture seule</div>}<Application /></>;
+  return <><NotificationCenter />{previewMode && <div role="status" className="fixed bottom-2 left-1/2 z-50 w-max max-w-[95vw] -translate-x-1/2 rounded-xl border border-amber-400/40 bg-white px-4 py-2 text-center text-xs text-amber-800">Aperçu sans base de données · données fictives · lecture seule</div>}<Application /></>;
 }
 
 function Application() {
@@ -61,6 +62,14 @@ function Application() {
   useEffect(() => {
     if (user) void fetchOrders();
     return () => { loadSequence.current += 1; };
+  }, [user, fetchOrders]);
+  useEffect(() => {
+    if (!user || previewMode) return;
+    const update = () => { if (document.visibilityState === 'visible') void fetchOrders(); };
+    const timer = setInterval(update, 15000);
+    window.addEventListener('focus', update);
+    document.addEventListener('visibilitychange', update);
+    return () => { clearInterval(timer); window.removeEventListener('focus', update); document.removeEventListener('visibilitychange', update); };
   }, [user, fetchOrders]);
   useEffect(() => {
     const expired = () => {

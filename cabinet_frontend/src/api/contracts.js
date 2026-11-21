@@ -1,3 +1,5 @@
+import { errorMessage } from './messages.js';
+
 export function rowsOf(data) {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.results)) return data.results;
@@ -22,10 +24,7 @@ export async function allRows(client, path, params = {}, signal) {
 }
 
 export function errorText(error) {
-  const flatten = value => typeof value === 'string' ? value : Array.isArray(value)
-    ? value.map(flatten).join(' ') : value && typeof value === 'object'
-      ? Object.entries(value).map(([key, val]) => `${key}: ${flatten(val)}`).join(' ') : String(value ?? '');
-  return (error.response?.data ? flatten(error.response.data) : '') || error.message || 'Connexion impossible.';
+  return errorMessage(error);
 }
 
 export const money = value => value == null ? 'Devis laboratoire requis' : `${Number(value).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} MAD`;

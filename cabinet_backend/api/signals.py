@@ -50,7 +50,7 @@ def capture_previous_status(sender, instance, raw, using, **kwargs):
     if not instance._state.adding:
         # Prescription.save() opens the transaction before pre_save is emitted.
         instance._previous_status = (
-            sender.objects.using(using).select_for_update()
+            sender.objects.using(using).select_for_update(no_key=True)
             .filter(pk=instance.pk).values_list('status', flat=True).first()
         )
     instance._previous_invoice = None

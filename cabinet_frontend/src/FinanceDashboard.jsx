@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import api from './api/client';
+import { labelFor } from './api/messages';
 import { allRows, download, errorText, money, retryableRequest, rowsOf } from './api/contracts';
 import { Button, control, Feedback, Field, Paged, Panel } from './IntegrationUI';
 
@@ -44,7 +45,7 @@ function InvoiceCard({ invoice, credits, busy, mutate }) {
 }
 function DisputeCard({ dispute, busy, mutate }) {
   const [notes, setNotes] = useState(''); const [amount, setAmount] = useState('');
-  return <div className="space-y-3 rounded-xl border border-slate-200/80 p-4"><p className="text-sm">Dossier {dispute.prescription} · {dispute.status}</p><p className="text-sm text-slate-500">{dispute.reason}</p>{dispute.status === 'OPEN' && <fieldset disabled={busy} className="space-y-3"><Field label="Justification de la décision"><textarea className={control} value={notes} onChange={e => setNotes(e.target.value)} /></Field>{dispute.invoice && <Field label="Montant de l’avoir si accepté (MAD)"><input className={control} type="number" min="0.01" step="0.01" value={amount} onChange={e => setAmount(e.target.value)} /></Field>}<div className="flex gap-3">{[['ACCEPTED','Accepter'],['REJECTED','Rejeter']].map(([decision,label]) => <Button key={decision} disabled={!notes.trim() || (decision === 'ACCEPTED' && dispute.invoice && !(Number(amount) > 0))} onClick={() => mutate(() => api.post(`billing/disputes/${dispute.id}/resolve/`, { decision, notes, ...(dispute.invoice ? { amount } : {}) }))}>{label}</Button>)}</div></fieldset>}</div>;
+  return <div className="space-y-3 rounded-xl border border-slate-200/80 p-4"><p className="text-sm">Dossier {dispute.prescription} · {labelFor(dispute.status)}</p><p className="text-sm text-slate-500">{dispute.reason}</p>{dispute.status === 'OPEN' && <fieldset disabled={busy} className="space-y-3"><Field label="Justification de la décision"><textarea className={control} value={notes} onChange={e => setNotes(e.target.value)} /></Field>{dispute.invoice && <Field label="Montant de l’avoir si accepté (MAD)"><input className={control} type="number" min="0.01" step="0.01" value={amount} onChange={e => setAmount(e.target.value)} /></Field>}<div className="flex gap-3">{[['ACCEPTED','Accepter'],['REJECTED','Rejeter']].map(([decision,label]) => <Button key={decision} disabled={!notes.trim() || (decision === 'ACCEPTED' && dispute.invoice && !(Number(amount) > 0))} onClick={() => mutate(() => api.post(`billing/disputes/${dispute.id}/resolve/`, { decision, notes, ...(dispute.invoice ? { amount } : {}) }))}>{label}</Button>)}</div></fieldset>}</div>;
 }
 function CatalogFinance() {
   const [month, setMonth] = useState(''); const [result, setResult] = useState(null); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);

@@ -13,6 +13,8 @@ from rest_framework.test import APIClient
 
 from .models import Prescription, PrescriptionHistory
 from .signals import prescription_audit_context
+from customers.models import PlatformAccount
+from .test_support import WorkflowFixtures
 
 
 @override_settings(OUTBOX_PUBLISH_ON_COMMIT=False, CACHES={
@@ -23,20 +25,25 @@ from .signals import prescription_audit_context
         'KEY_FUNCTION': 'django_tenants.cache.make_key',
     },
 })
-class PrescriptionCQRSTests(TenantTestCase):
+class PrescriptionCQRSTests(WorkflowFixtures, TenantTestCase):
     @classmethod
     def setup_tenant(cls, tenant):
         tenant.name = 'CQRS laboratory'
 
     def setUp(self):
+        super().setUp()
         connection.set_tenant(self.tenant)
         cache.clear()
         self.client = APIClient(HTTP_HOST=self.get_test_tenant_domain())
+        with schema_context('public'):
+            self.manager = PlatformAccount.objects.create(name='CQRS manager', login_key='cqrs-manager',
+                role='LAB', laboratory=self.tenant, workstation_role='MANAGER')
+        self.client.force_authenticate(user=self.manager)
 
     def create_order(self, **changes):
         return Prescription.objects.create(
             patient_ref='CQRS-001', dentist_name='Clinic', tooth_number=11,
-            shade='A2', material='Zircone', disinfected=True, **changes,
+            **{'shade': 'A2', 'material': 'Zircone', 'disinfected': True, 'accepted': True, **changes},
         )
 
     def test_creation_and_real_transitions_append_audit_records(self):
@@ -107,22 +114,26 @@ class PrescriptionCQRSTests(TenantTestCase):
     def test_list_caches_active_orders_and_retains_optional_completed_orders(self):
         active = self.create_order()
         completed = self.create_order()
-        completed.status = 'LIVRE'
-        completed.save()
+        from .models import PartnerClinic
+        clinic = PartnerClinic.objects.create(name='Cache clinic', pickup_address='Test road')
+        for order in (active, completed):
+            order.partner_clinic = clinic
+            order.base_amount = order.total_price = 500
+            order.save()
+        self.deliver_case(completed)
         first = self.client.get('/api/prescriptions/')
         self.assertEqual(first.status_code, 200, first.data)
-        self.assertEqual([str(row['id']) for row in first.data], [str(active.pk)])
+        self.assertEqual([str(row['id']) for row in first.data['results']], [str(active.pk)])
         with CaptureQueriesContext(connection) as queries:
             second = self.client.get('/api/prescriptions/')
         self.assertEqual(second.data, first.data)
         self.assertFalse(any('FROM "api_prescription"' in query['sql'] for query in queries))
         all_orders = self.client.get('/api/prescriptions/?include_completed=true')
-        self.assertEqual(len(all_orders.data), 2)
+        self.assertEqual(len(all_orders.data['results']), 2)
         with self.captureOnCommitCallbacks(execute=True):
-            active.status = 'LIVRE'
-            active.save()
-        self.assertEqual(self.client.get('/api/prescriptions/').data, [])
-        self.assertEqual(cache.get('active_orders'), [])
+            self.deliver_case(active)
+        self.assertEqual(self.client.get('/api/prescriptions/').data['results'], [])
+        self.assertEqual(cache.get('active_orders')['rows'], [])
 
     def test_non_status_writes_refresh_serialized_cache(self):
         order = self.create_order()
@@ -130,7 +141,7 @@ class PrescriptionCQRSTests(TenantTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             order.total_price = 900
             order.save(update_fields=['total_price'])
-        self.assertEqual(self.client.get('/api/prescriptions/').data[0]['total_price'], 900)
+        self.assertEqual(self.client.get('/api/prescriptions/').data['results'][0]['total_price'], '900.00')
         self.assertEqual(order.audit_history.count(), 1)
 
     def test_history_and_prescriptions_are_protected_from_destructive_writes(self):
@@ -169,7 +180,8 @@ class PrescriptionCQRSTests(TenantTestCase):
         self.assertEqual(response.status_code, 200, response.data)
         event = order.audit_history.last()
         self.assertEqual(event.action_notes, 'Rework review')
-        self.assertEqual(event.changed_by, 'anonymous')
+        self.assertEqual(event.changed_by, f'platform:{self.manager.pk}:{self.manager.name}')
+        self.assertNotEqual(event.changed_by, 'spoofed')
         self.assertNotIn('action_notes', response.data)
 
     def test_cache_failure_does_not_abort_audited_writes_or_database_reads(self):

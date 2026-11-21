@@ -1,5 +1,6 @@
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Barrier
 from datetime import datetime, date, timedelta
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from django.test import TransactionTestCase, override_settings
 from django_tenants.test.cases import TenantTestCase
 from django_tenants.utils import schema_context
 from rest_framework.test import APIClient
+from rest_framework.exceptions import ValidationError as APIValidationError
 
 from customers.models import Client, PlatformAccount
 from .case_commands import execute_case_command
@@ -63,7 +65,7 @@ class PlanningTests(TenantTestCase):
             order.save()
         order.refresh_from_db()
 
-    def cao_case(self,**values):
+    def planning_case(self,**values):
         order=self.order(**values)
         self.update(order,accepted=True)
         self.update(order,status='ANALYSE_DEMANDE')
@@ -73,6 +75,10 @@ class PlanningTests(TenantTestCase):
         execute_case_command(order.pk,'inspection',{'stage':'DIGITAL','checks':dict.fromkeys(['margins','occlusion','space','scan_quality'],True)},self.actor,'MANAGER',uuid.uuid4())
         self.update(order,status='CONTROLE_DOSSIER',reception_validated=True)
         self.update(order,status='PLANIFICATION')
+        return order
+
+    def cao_case(self,**values):
+        order=self.planning_case(**values)
         if order.delivery_service=='NEXT_DAY' and order.total_price is None:
             return order
         self.update(order,status='SALLE_CAO',production_method='CFAO',delivery_date=date(2026,11,13))
@@ -147,6 +153,55 @@ class PlanningTests(TenantTestCase):
         with transaction.atomic(): sync_order(order)
         self.assertFalse(order.planning_tasks.filter(workflow_step='USINAGE_CNC').exclude(status='CANCELLED').exists())
 
+    def test_late_start_and_resume_replan_movable_bookings_without_overlap(self):
+        self.employee(); orders=[self.cao_case(),self.cao_case()]
+        recalculate(now=NOW)
+        first, following=sorted([self.task(order) for order in orders],key=lambda task:task.planned_start)
+        order=next(order for order in orders if order.pk==first.prescription_id)
+        later=NOW+timedelta(seconds=10)
+        with patch('django.utils.timezone.now',return_value=later):
+            self.command(order,'planning-start',{'task':str(first.pk)})
+        first.refresh_from_db();following.refresh_from_db()
+        self.assertEqual(first.planned_start,later)
+        self.assertEqual(first.status,'IN_PROGRESS')
+        self.assertLessEqual(first.planned_end,following.planned_start)
+        with patch('django.utils.timezone.now',return_value=later+timedelta(seconds=10)):
+            self.command(order,'planning-pause',{'task':str(first.pk),'notes':'Operator break'})
+        resumed=later+timedelta(minutes=5)
+        with patch('django.utils.timezone.now',return_value=resumed):
+            self.command(order,'planning-resume',{'task':str(first.pk)})
+        first.refresh_from_db();following.refresh_from_db()
+        self.assertEqual(first.status,'IN_PROGRESS')
+        self.assertEqual(first.planned_start,resumed)
+        self.assertLessEqual(first.planned_end,following.planned_start)
+
+    def test_late_start_preserves_locked_booking_and_rolls_back(self):
+        self.employee(); orders=[self.cao_case(),self.cao_case()]
+        recalculate(now=NOW)
+        first,following=sorted([self.task(order) for order in orders],key=lambda task:task.planned_start)
+        order=next(order for order in orders if order.pk==first.prescription_id)
+        following.locked=True;following.save()
+        reservation=(following.planned_start,following.planned_end)
+        with patch('django.utils.timezone.now',return_value=NOW+timedelta(seconds=10)):
+            with self.assertRaisesMessage(ValidationError,'Conflit de réservation'):
+                self.command(order,'planning-start',{'task':str(first.pk)})
+        first.refresh_from_db();following.refresh_from_db()
+        self.assertEqual(first.status,'READY')
+        self.assertIsNone(first.actual_start)
+        self.assertEqual((following.planned_start,following.planned_end),reservation)
+
+    def test_future_booking_cannot_jump_the_queue(self):
+        self.employee(); orders=[self.cao_case(),self.cao_case()]
+        recalculate(now=NOW)
+        first,future=sorted([self.task(order) for order in orders],key=lambda task:task.planned_start)
+        order=next(order for order in orders if order.pk==future.prescription_id)
+        with self.assertRaisesMessage(ValidationError,'Créneau futur'):
+            self.command(order,'planning-start',{'task':str(future.pk)})
+        first.refresh_from_db();future.refresh_from_db()
+        self.assertEqual(first.planned_start,NOW)
+        self.assertEqual(future.status,'READY')
+        self.assertIsNone(future.actual_start)
+
     def test_locked_assignment_survives_replanning_and_reports_absence(self):
         employee=self.employee();order=self.cao_case();recalculate(now=NOW);task=self.task(order)
         self.command(order,'planning-lock',{'task':str(task.pk),'locked':True})
@@ -173,6 +228,19 @@ class PlanningTests(TenantTestCase):
         with self.assertRaises(ValidationError): self.command(order,'planning-complete',{'task':str(task.pk)})
         task.refresh_from_db();order.refresh_from_db()
         self.assertEqual(task.status,'IN_PROGRESS');self.assertEqual(order.status,'PREPARATION_CNC')
+
+    def test_completion_with_advancing_clock_does_not_resave_immutable_task(self):
+        self.employee();order=self.cao_case();recalculate(now=NOW);task=self.task(order)
+        self.command(order,'planning-start',{'task':str(task.pk)})
+        ticks=iter(NOW+timedelta(milliseconds=n) for n in range(1000))
+        key=uuid.uuid4()
+        with patch('django.utils.timezone.now',side_effect=lambda:next(ticks)):
+            self.command(order,'planning-complete',{'task':str(task.pk)},key)
+            self.command(order,'planning-complete',{'task':str(task.pk)},key)
+        task.refresh_from_db();order.refresh_from_db()
+        self.assertEqual(task.status,'COMPLETED')
+        self.assertEqual(order.status,'PREPARATION_CNC')
+        self.assertEqual(PlanningEvent.objects.filter(task=task,kind='PLANNING_COMPLETE').count(),1)
 
     def test_manual_assignment_rejects_absence_and_conflicting_slot(self):
         employee=self.employee();order=self.cao_case();recalculate(now=NOW);task=self.task(order)
@@ -252,6 +320,59 @@ class PlanningTests(TenantTestCase):
         order.refresh_from_db();self.assertEqual(order.status,'PREPARATION_CNC')
         task=self.task(order);self.assertEqual(task.status,'COMPLETED')
 
+    def test_route_selection_and_advancement_are_atomic_and_idempotent(self):
+        for method, target in [('CFAO','SALLE_CAO'), ('IMPRESSION_3D','SALLE_CAO'), ('CONVENTIONNEL','MODELE_TRAVAIL')]:
+            with self.subTest(method=method):
+                order=self.planning_case()
+                version, count=order.state_version, order.audit_history.count()
+                key=uuid.uuid4()
+                payload={'production_method':method,'delivery_date':'2026-11-13'}
+                self.command(order,'advance',payload,key)
+                order.refresh_from_db()
+                self.assertEqual(order.status,target)
+                self.assertEqual(order.production_method,method)
+                self.assertEqual(order.state_version,version+1)
+                self.assertEqual(order.audit_history.count(),count+1)
+                self.command(order,'advance',payload,key)
+                order.refresh_from_db()
+                self.assertEqual(order.state_version,version+1)
+                self.assertEqual(order.audit_history.count(),count+1)
+
+    def test_route_selection_preserves_design_approval_gate(self):
+        order=self.planning_case(design_validation_requested=True)
+        self.command(order,'advance',{'production_method':'IMPRESSION_3D','delivery_date':'2026-11-13'})
+        order.refresh_from_db()
+        self.assertEqual(order.status,'SALLE_CAO')
+        with self.assertRaises(ValidationError):
+            self.command(order,'advance',{})
+        order.refresh_from_db()
+        self.assertEqual(order.status,'SALLE_CAO')
+
+    def test_invalid_route_or_date_does_not_write_history(self):
+        order=self.planning_case()
+        count=order.audit_history.count()
+        for payload in [{'production_method':'INVALID','delivery_date':'2026-11-13'},
+                        {'production_method':'IMPRESSION_3D','delivery_date':'not-a-date'}]:
+            response=self.client.post(f'/api/prescriptions/{order.pk}/command/',
+                {'action':'advance','data':payload},format='json',HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()))
+            self.assertEqual(response.status_code,400,response.data)
+        order.refresh_from_db()
+        self.assertEqual(order.status,'PLANIFICATION')
+        self.assertEqual(order.production_method,'')
+        self.assertEqual(order.audit_history.count(),count)
+
+    def test_cao_cannot_choose_production_route(self):
+        order=self.planning_case()
+        self.manager.workstation_role='CAO'
+        self.manager.save(update_fields=['workstation_role'])
+        response=self.client.post(f'/api/prescriptions/{order.pk}/command/',
+            {'action':'advance','data':{'production_method':'IMPRESSION_3D','delivery_date':'2026-11-13'}},
+            format='json',HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()))
+        self.assertEqual(response.status_code,400,response.data)
+        order.refresh_from_db()
+        self.assertEqual(order.status,'PLANIFICATION')
+        self.assertEqual(order.production_method,'')
+
     def test_settings_publish_the_scheduler_timezone_rules(self):
         response=self.client.get('/api/planning/settings/')
         self.assertEqual(response.status_code,200,response.data)
@@ -261,9 +382,238 @@ class PlanningTests(TenantTestCase):
         changes=[r for r in zone['transitions'] if datetime.fromisoformat(r['at']).timestamp()<=at]
         self.assertEqual(changes[-1]['offset'],int(NOW.utcoffset().total_seconds()/60))
 
+    def machine_case(self):
+        from .business_models import ProductionLot
+        settings=configuration()
+        settings.step_rules={**settings.step_rules,'USINAGE_CNC':{**settings.step_rules.get('USINAGE_CNC',{}),'unattended':True}}
+        settings.save()
+        order=self.cao_case()
+        self.command(order,'advance',{})
+        lot=ProductionLot.objects.create(code='PHASE-'+uuid.uuid4().hex)
+        lot.prescriptions.add(order)
+        self.command(order,'advance',{})
+        order.refresh_from_db()
+        self.assertEqual(order.status,'USINAGE_CNC')
+        return order
+
+    def manual_booking(self,order,employee,start,end,**extra):
+        return PlanningTask.objects.create(prescription=order,workflow_step='TEST_'+uuid.uuid4().hex[:8],
+            title='Additional attended work',sequence=100,required_role='FAO',workstation='FAO',
+            assigned_employee=employee,planned_start=start,planned_end=end,status='SCHEDULED',**extra)
+
+    def test_equipment_plan_books_only_setup_and_unloading_for_employee(self):
+        from .planning_phases import equipment_slot
+        employee=self.employee('FAO')
+        Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=2,status='ACTIF')
+        first,second=self.machine_case(),self.machine_case()
+        recalculate(now=NOW)
+        a,b=sorted([self.task(first,'USINAGE_CNC'),self.task(second,'USINAGE_CNC')],key=lambda t:t.planned_start)
+        self.assertEqual(a.resource_phase,'PLANNED')
+        self.assertEqual(a.assigned_employee_id,employee.pk)
+        self.assertLess(b.planned_start,a.planned_end)
+        self.assertNotEqual(a.machine_slot,b.machine_slot)
+        # PostgreSQL accepts attended work inside the unattended interval.
+        self.manual_booking(first,employee,NOW+timedelta(minutes=25),NOW+timedelta(minutes=30))
+        with self.assertRaises(IntegrityError),transaction.atomic():
+            self.manual_booking(first,employee,a.planned_start,a.planned_start+timedelta(minutes=5))
+        with self.assertRaises(IntegrityError),transaction.atomic():
+            self.manual_booking(first,employee,a.planned_end-timedelta(minutes=5),a.planned_end)
+        settings=configuration()
+        self.assertIsNone(equipment_slot(employee,a,a.machine,a.machine_slot,
+            NOW+timedelta(days=settings.horizon_days+1),settings,[]))
+
+    def test_phase_commands_release_employee_but_hold_machine_until_unloaded(self):
+        employee=self.employee('FAO')
+        machine=Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case();recalculate(now=NOW);task=self.task(order,'USINAGE_CNC')
+        self.command(order,'planning-start',{'task':str(task.pk)})
+        task.refresh_from_db();self.assertEqual(task.resource_phase,'SETUP')
+        with self.assertRaises(ValidationError): self.command(order,'planning-complete',{'task':str(task.pk)})
+        at=NOW+timedelta(minutes=10)
+        with patch('django.utils.timezone.now',return_value=at):
+            self.command(order,'planning-launch-cycle',{'task':str(task.pk)})
+        task.refresh_from_db();self.assertEqual(task.worked_seconds,600)
+        self.assertTrue(task.dependents.filter(status='BLOCKED',blocking_reason__contains='Déchargement').exists())
+        self.manual_booking(order,employee,at,at+timedelta(minutes=5))
+        later=NOW+timedelta(hours=4)
+        with self.assertRaises(IntegrityError),transaction.atomic():
+            self.manual_booking(order,None,later,later+timedelta(minutes=10),machine=machine)
+        key=uuid.uuid4()
+        with patch('django.utils.timezone.now',return_value=NOW+timedelta(minutes=50)):
+            self.command(order,'planning-cycle-finished',{'task':str(task.pk),'notes':'Machine stopped; physical cycle verified'},key)
+            self.command(order,'planning-cycle-finished',{'task':str(task.pk),'notes':'Machine stopped; physical cycle verified'},key)
+            task.refresh_from_db();self.assertEqual(task.resource_phase,'AWAITING_UNLOAD')
+            with self.assertRaises((ValidationError,APIValidationError)): self.command(order,'advance',{})
+            self.command(order,'planning-begin-unload',{'task':str(task.pk)})
+        with patch('django.utils.timezone.now',return_value=NOW+timedelta(minutes=60)):
+            self.command(order,'planning-complete',{'task':str(task.pk)})
+        task.refresh_from_db();order.refresh_from_db()
+        self.assertEqual(task.resource_phase,'FINISHED');self.assertEqual(task.status,'COMPLETED')
+        self.assertEqual(task.worked_seconds,1200)
+        self.assertIsNotNone(task.unloaded_at)
+        self.assertNotEqual(order.status,'USINAGE_CNC')
+        self.assertFalse(order.quality_validated)
+        self.assertEqual(task.events.filter(kind='PLANNING_CYCLE_FINISHED').count(),1)
+        self.manual_booking(order,None,later,later+timedelta(minutes=10),machine=machine)
+
+    def test_unattended_cycle_crosses_shift_but_both_attended_windows_are_on_shift(self):
+        self.employee('FAO')
+        Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case()
+        settings=configuration();settings.step_rules={'USINAGE_CNC':{'duration':540,'unattended':True}};settings.save()
+        recalculate(now=NOW+timedelta(hours=8))
+        task=self.task(order,'USINAGE_CNC')
+        self.assertEqual(task.planned_start,NOW+timedelta(hours=8))
+        self.assertEqual(task.planned_end.astimezone(TZ).date(),NOW.date()+timedelta(days=1))
+        self.assertEqual(task.planned_end.astimezone(TZ).hour,8)
+        with patch('django.utils.timezone.now',return_value=task.planned_start):
+            self.command(order,'planning-start',{'task':str(task.pk)})
+        task.refresh_from_db();self.assertEqual(task.resource_phase,'SETUP')
+
+    def test_unloading_rejects_absence_and_retains_machine_on_blocked_task(self):
+        employee=self.employee('FAO')
+        machine=Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case();recalculate(now=NOW);task=self.task(order,'USINAGE_CNC')
+        self.command(order,'planning-start',{'task':str(task.pk)})
+        self.command(order,'planning-launch-cycle',{'task':str(task.pk)})
+        self.command(order,'planning-cycle-finished',{'task':str(task.pk),'notes':'Completed equipment cycle'})
+        EmployeeAvailability.objects.create(employee=employee,availability_type='ABSENCE',starts_at=NOW,ends_at=NOW+timedelta(hours=2))
+        with self.assertRaises(ValidationError): self.command(order,'planning-begin-unload',{'task':str(task.pk)})
+        self.command(order,'planning-block',{'task':str(task.pk),'notes':'Operator absent; machine remains loaded'})
+        recalculate(now=NOW+timedelta(hours=3));task.refresh_from_db()
+        self.assertEqual(task.resource_phase,'AWAITING_UNLOAD');self.assertEqual(task.status,'BLOCKED')
+        with self.assertRaises(IntegrityError),transaction.atomic():
+            self.manual_booking(order,None,NOW+timedelta(days=1),NOW+timedelta(days=1,minutes=10),machine=machine)
+
+    def test_cycle_completion_requires_explicit_confirmation_and_cannot_skip_phases(self):
+        self.employee('FAO')
+        Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case();recalculate(now=NOW);task=self.task(order,'USINAGE_CNC')
+        before=order.audit_history.count()
+        with self.assertRaises((ValidationError,APIValidationError)): self.command(order,'advance',{})
+        order.refresh_from_db();self.assertEqual(order.status,'USINAGE_CNC')
+        self.assertEqual(order.audit_history.count(),before)
+        self.command(order,'planning-start',{'task':str(task.pk)})
+        with self.assertRaises(ValidationError): self.command(order,'planning-begin-unload',{'task':str(task.pk)})
+        self.command(order,'planning-launch-cycle',{'task':str(task.pk)})
+        with self.assertRaises(ValidationError): self.command(order,'planning-cycle-finished',{'task':str(task.pk)})
+        task.refresh_from_db();self.assertEqual(task.resource_phase,'CYCLE')
+        self.assertFalse(task.last_started_at)
+
+    def test_phase_workload_excludes_the_unattended_cycle(self):
+        employee=self.employee('FAO')
+        Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case();recalculate(now=NOW);task=self.task(order,'USINAGE_CNC')
+        result=self.client.get('/api/planning/workload/',{'start':NOW.isoformat(),'end':task.planned_end.isoformat()})
+        row=next(r for r in result.data['results'] if r['employee']==employee.pk)
+        self.assertEqual(row['planned_minutes'],20)
+
+    def test_invalid_phase_configuration_and_unauthorized_operator_are_rejected(self):
+        response=self.client.patch('/api/planning/settings/',{'step_rules':{'USINAGE_CNC':{'duration':20,'unattended':True}}},format='json')
+        self.assertEqual(response.status_code,400,response.data)
+        employee=self.employee('FAO')
+        Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case();recalculate(now=NOW);task=self.task(order,'USINAGE_CNC')
+        self.command(order,'planning-start',{'task':str(task.pk)})
+        with self.assertRaises(ValidationError):
+            execute_case_command(order.pk,'planning-launch-cycle',{'task':str(task.pk)},'user:999:Other','FAO',uuid.uuid4())
+        execute_case_command(order.pk,'planning-launch-cycle',{'task':str(task.pk)},f'user:{employee.user_id}:FAO','FAO',uuid.uuid4())
+
+    def test_only_supervisor_with_reason_can_bring_forward_a_movable_reservation(self):
+        employee=self.employee('FAO')
+        Machine.objects.create(name='CNC phases',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+        order=self.machine_case();recalculate(now=NOW+timedelta(hours=1));task=self.task(order,'USINAGE_CNC')
+        data={'task':str(task.pk),'start_now':True,'notes':'Ready case; reschedule movable forecasts'}
+        with self.assertRaises(ValidationError):
+            execute_case_command(order.pk,'planning-start',data,f'user:{employee.user_id}:FAO','FAO',uuid.uuid4())
+        with self.assertRaises(ValidationError):
+            self.command(order,'planning-start',{'task':str(task.pk),'start_now':True})
+        self.command(order,'planning-start',data)
+        task.refresh_from_db();self.assertEqual(task.resource_phase,'SETUP')
+        self.assertEqual(task.planned_start,NOW)
+
 
 @override_settings(**TEST_SETTINGS)
 class PlanningConcurrencyTests(TransactionTestCase):
+    def test_concurrent_cycles_cannot_claim_the_same_machine_slot(self):
+        connection.set_schema_to_public()
+        tenant=Client.objects.create(schema_name='planning_phase_race',name='Disposable phase race')
+        gate=Barrier(2)
+        try:
+            with schema_context(tenant.schema_name):
+                machine=Machine.objects.create(name='Race CNC',machine_type='USINEUSE_CNC',capacity=1,status='ACTIF')
+                order=Prescription.objects.create(patient_ref='PHASE-RACE',dentist_name='D',disinfected=True,total_price='1200',tooth_number='11',material='Zircone',shade='A1')
+                source_id,machine_id=order.pk,machine.pk
+            def claim(number):
+                try:
+                    with schema_context(tenant.schema_name):
+                        gate.wait(timeout=10)
+                        with transaction.atomic():
+                            PlanningTask.objects.create(prescription_id=source_id,workflow_step=f'RACE_{number}',title='Equipment race',
+                                sequence=number,required_role='FAO',workstation='FAO',machine_id=machine_id,
+                                planned_start=NOW+timedelta(hours=number),planned_end=NOW+timedelta(hours=number+1),
+                                status='IN_PROGRESS',resource_phase='CYCLE')
+                    return 'committed'
+                except IntegrityError:
+                    return 'rejected'
+                except DatabaseError as exc:
+                    # Raw concurrent GiST inserts can choose a deadlock victim
+                    # instead of an exclusion violation. Application commands
+                    # avoid this race with the tenant planning advisory lock.
+                    if getattr(exc.__cause__,'sqlstate',None) == '40P01':
+                        return 'rejected'
+                    raise
+                finally:
+                    connections['default'].close()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(claim,[1,2]))
+            self.assertEqual(sorted(results),['committed','rejected'])
+            with schema_context(tenant.schema_name):
+                self.assertEqual(PlanningTask.objects.filter(resource_phase='CYCLE').count(),1)
+        finally:
+            connection.set_schema_to_public();tenant.delete(force_drop=True)
+
+    def test_recalculation_commits_while_source_writer_waits_for_planning_lock(self):
+        from .planning import lock_planning
+        connection.set_schema_to_public()
+        tenant=Client.objects.create(schema_name='planning_lock_order',name='Disposable planning lock test')
+        writer_locked,planner_locked,writer_waiting=Event(),Event(),Event()
+        try:
+            with schema_context(tenant.schema_name):
+                user=get_user_model().objects.create_user(username='planning-lock-order')
+                EmployeeProfile.objects.create(user=user,role='RECEPTION',contract_type='CDI',hire_date=date(2026,1,1))
+                order=Prescription.objects.create(patient_ref='LOCK-ORDER',dentist_name='D',disinfected=True,
+                    total_price='1200',tooth_number='11',material='Zircone',shade='A1')
+                order.accepted=True;order.save()
+                recalculate(now=NOW)
+                source_id=order.pk
+            def writer():
+                try:
+                    with schema_context(tenant.schema_name),transaction.atomic():
+                        Prescription.objects.select_for_update(no_key=True).get(pk=source_id)
+                        writer_locked.set()
+                        if not planner_locked.wait(10): raise AssertionError('Planner did not acquire its lock')
+                        writer_waiting.set()
+                        execute_case_command(source_id,'note',{'notes':'Concurrent operator note'},
+                            'test:writer','MANAGER',uuid.uuid4())
+                    return 'writer committed'
+                finally: connections['default'].close()
+            def planner():
+                try:
+                    if not writer_locked.wait(10): raise AssertionError('Writer did not lock the source')
+                    with schema_context(tenant.schema_name),transaction.atomic():
+                        lock_planning();planner_locked.set()
+                        if not writer_waiting.wait(10): raise AssertionError('Writer did not request planning')
+                        recalculate(now=NOW+timedelta(seconds=10))
+                    return 'planner committed'
+                finally: connections['default'].close()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first,second=pool.submit(writer),pool.submit(planner)
+                self.assertEqual(second.result(timeout=20),'planner committed')
+                self.assertEqual(first.result(timeout=20),'writer committed')
+        finally:
+            connection.set_schema_to_public();tenant.delete(force_drop=True)
+
     def test_concurrent_recalculation_uses_one_consistent_reservation_set(self):
         connection.set_schema_to_public()
         tenant=Client.objects.create(schema_name='planning_race',name='Disposable planning race')

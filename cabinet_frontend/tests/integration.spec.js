@@ -1,5 +1,32 @@
 import { test, expect } from '@playwright/test';
 
+for (const viewport of [{ width: 1440, height: 1000 }, { width: 912, height: 768 }, { width: 390, height: 640 }]) {
+  test(`account menu stays above stock controls and logout works at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await session(page);
+    await mocks(page);
+    await page.goto('/static/');
+    if (viewport.width <= 650) await page.getByRole('button', { name: 'Ouvrir la navigation', exact: true }).click();
+    await page.getByRole('button', { name: 'Stocks et lots', exact: true }).click();
+    if (viewport.width === 912) await page.getByRole('button', { name: 'Réduire la navigation', exact: true }).click();
+    await page.getByRole('button', { name: 'Mon compte', exact: true }).click();
+    const panel = page.locator('#account-panel');
+    await expect(panel).toBeVisible();
+    const bounds = await panel.boundingBox();
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width);
+    const logout = panel.getByRole('button', { name: 'Déconnexion', exact: true });
+    await logout.scrollIntoViewIfNeeded();
+    await expect.poll(() => logout.evaluate(button => {
+      const rect = button.getBoundingClientRect();
+      return button.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+    })).toBe(true);
+    await logout.click();
+    await expect(page.locator('#login-portal')).toBeVisible();
+    expect(await page.evaluate(() => sessionStorage.getItem('demo_user'))).toBeNull();
+  });
+}
+
 const id = 'd3f16d2a-4910-47cb-920d-8c1011539c01';
 const caseOrder = (overrides = {}) => ({ id, patient_ref: 'PAT-TEST', dentist_name: 'Dentiste test', laboratory_id: 'labo1', laboratory_name: 'Laboratoire test', partner_clinic: 1, status: 'ANALYSE_DEMANDE', status_label: 'Analyse de la demande', accepted: true, total_price: '1200.00', production_attempt: 1, intake_version: 2, impression_type: 'PHYSIQUE', delivery_service: 'STANDARD', updated_at: '2026-11-04T12:00:00Z', clinical_items: [{ tooth_number: 11, function: 'Couronne', form: 'Anatomique', material: 'Zircone', shade: 'A1' }], workflow_steps: [{ key: 'ANALYSE_DEMANDE', label: 'Analyse' }, { key: 'ATTENTE_RAMASSAGE', label: 'Ramassage' }], next_status: 'ATTENTE_RAMASSAGE', ...overrides });
 async function session(page, role = 'Laboratoire', workstation_role = 'MANAGER') {
@@ -7,6 +34,13 @@ async function session(page, role = 'Laboratoire', workstation_role = 'MANAGER')
     sessionStorage.setItem('demo_user', JSON.stringify({ name: 'Compte de test', role, workstation_role }));
     sessionStorage.setItem('demo_token', 'fixture-token'); sessionStorage.setItem('tenant_id', 'labo1');
   }, { role, workstation_role });
+}
+async function openClinical(page) {
+  const dialog = page.getByRole('dialog', { name: /Dossier clinique/ });
+  if (!await dialog.isVisible()) await page.getByRole('button', { name: 'Ouvrir les documents et actions' }).click();
+  const tab = dialog.getByRole('tab', { name: 'Contrôles et documents' });
+  if (await tab.count()) await tab.click();
+  return dialog;
 }
 async function mocks(page, handler) {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
@@ -83,9 +117,9 @@ test('courier submits QR custody and actual entered PIN through commands', async
     if (path === '/api/prescriptions/') return { count: 1, results: [order], next: null };
     if (path.endsWith('/command/')) { const payload = req.postDataJSON(); commands.push(payload); order = { ...order, status: payload.action === 'checkout' ? 'EN_ROUTE_CABINET' : 'LIVRE' }; return { case: order, result: {} }; }
   });
-  await page.goto('/static/'); await page.getByLabel('Contenu du QR signé').fill('signed-token');
-  await page.getByRole('button', { name: 'Sortir du laboratoire' }).click();
-  await page.getByLabel('PIN réel de livraison').fill('0789'); await page.getByRole('button', { name: 'Confirmer la livraison' }).click();
+  await page.goto('/static/'); await page.getByRole('button', { name: 'Sortir du laboratoire', exact: true }).click(); await page.getByLabel('Contenu du QR signé').fill('signed-token');
+  await page.getByRole('dialog').getByRole('button', { name: 'Sortir du laboratoire', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirmer la livraison', exact: true }).click(); await page.getByLabel('PIN réel de livraison').fill('0789'); await page.getByRole('dialog').getByRole('button', { name: 'Confirmer la livraison', exact: true }).click();
   await expect.poll(() => commands.length).toBe(2);
   expect(commands).toEqual([{ action: 'checkout', data: { qr_token: 'signed-token' } }, { action: 'confirm-delivery', data: { pin: '0789' } }]);
 });
@@ -97,7 +131,7 @@ test('clinical inspection records explicit checks through the evidence command',
     if (path.endsWith('/command/')) { commands.push(req.postDataJSON()); return { case: order, result: {} }; }
   });
   await page.goto('/static/'); await page.getByRole('button', { name: 'Commandes', exact: true }).first().click(); await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click();
-  await page.getByRole('button', { name: 'Ouvrir les documents et actions' }).click();
+  await openClinical(page);
   for (const name of ['Absence de déformation','Absence de bulles','Limites lisibles','Occlusion','Hygiène']) await page.getByLabel(name + ' conforme', { exact: true }).check();
   await page.getByRole('button', { name: 'Enregistrer le contrôle' }).click();
   await expect.poll(() => commands.length).toBe(1); expect(commands[0].action).toBe('inspection'); expect(commands[0].data.stage).toBe('PHYSICAL'); expect(Object.values(commands[0].data.checks)).toEqual([true,true,true,true,true,false]);
@@ -154,9 +188,9 @@ test('dentist approves a pending design and reports a linked zero-loss remake', 
     if (path.endsWith('/evidence/')) return { design_reviews: [review], reworks: [], notifications: [] };
     if (path.endsWith('/command/')) { commands.push(req.postDataJSON()); order = { ...order, status: 'LIVRE', status_label: 'Livré' }; review.status = 'APPROVED'; return { case: order, result: {} }; }
   });
-  await page.goto('/static/'); await page.getByRole('button', { name: 'Mes commandes (1)' }).click(); await page.getByRole('button', { name: 'Ouvrir les documents et actions' }).click();
+  await page.goto('/static/'); await page.getByRole('button', { name: 'Mes commandes (1)' }).click(); await openClinical(page);
   await page.getByRole('button', { name: 'Approuver', exact: true }).click();
-  await expect(page.getByText('Version 1 · APPROVED')).toBeVisible();
+  await expect(page.getByText('Version 1 · Approuvé')).toBeVisible();
   expect(commands[0]).toEqual({ action: 'design-decision', data: { review: 'review-1', decision: 'APPROVED', notes: '' } });
   await page.getByLabel('Étape de reprise').selectOption('SALLE_CAO'); await page.getByLabel('Cause', { exact: true }).fill('Ajustage'); await page.getByLabel('Action corrective').fill('Reconcevoir');
   await page.getByRole('button', { name: 'Enregistrer la reprise documentée' }).click();
@@ -177,9 +211,10 @@ test('manual J+1 surcharge is sent as an accounting command', async ({ page }) =
     if (path === '/api/prescriptions/') return { results: [order], next: null };
     if (path.endsWith('/command/')) { command = req.postDataJSON(); return { case: order, result: { total_price: '1500' } }; }
   });
-  await page.goto('/static/'); await page.getByRole('button', { name: 'Commandes', exact: true }).first().click(); await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click(); await page.getByRole('button', { name: 'Ouvrir les documents et actions' }).click();
+  await page.goto('/static/'); await page.getByRole('button', { name: 'Commandes', exact: true }).first().click(); await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click(); await openClinical(page);
   await page.getByLabel('Supplément urgence (MAD)').fill('300.00'); await page.getByRole('button', { name: 'Confirmer le devis laboratoire' }).click();
   await expect.poll(() => command).toBeTruthy(); expect(command).toEqual({ action: 'quote', data: { surcharge: '300.00', notes: '' } });
+  await page.getByRole('tab', { name: 'Étape et choix techniques' }).click();
   await expect(page.getByRole('button', { name: 'Enregistrer les informations' })).toBeDisabled();
 });
 
@@ -190,7 +225,7 @@ test('measured rework references original consumption rather than a stock deduct
     if (path === '/api/inventory-transactions/') return { results: [{ id: 'usage-1', transaction_type: 'USAGE', production_attempt: 1, quantity_changed: '-2.000000', material_name_snapshot: 'Zircone', unit_snapshot: 'DISQUE' }], next: null };
     if (path.endsWith('/command/')) { command = req.postDataJSON(); return { case: order, result: {} }; }
   });
-  await page.goto('/static/'); await page.getByRole('button', { name: 'Commandes', exact: true }).first().click(); await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click(); await page.getByRole('button', { name: 'Ouvrir les documents et actions' }).click();
+  await page.goto('/static/'); await page.getByRole('button', { name: 'Commandes', exact: true }).first().click(); await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click(); await openClinical(page);
   await page.getByLabel('Étape de reprise').selectOption('FINITION'); await page.getByLabel('Cause', { exact: true }).fill('Contact'); await page.getByLabel('Action corrective').fill('Corriger'); await page.getByLabel('Perte sur Zircone').fill('0.25'); await page.getByRole('button', { name: 'Enregistrer la reprise documentée' }).click();
   await expect.poll(() => command).toBeTruthy(); expect(command.action).toBe('rework'); expect(command.data.losses).toEqual([{ usage_id: 'usage-1', quantity: '0.25' }]);
 });
@@ -242,6 +277,70 @@ test('laboratory identity, matching favicon and resource tabs with two-decimal q
 });
 
 const planningTask=()=>({id:'a94eb25f-4910-47cb-920d-8c1011539c01',prescription:id,workflow_step:'SALLE_CAO',title:'Conception CAO',patient_ref:'PAT-TEST',assigned_employee:1,employee_name:'Technicien CAO',required_role:'CAO',status:'READY',planned_start:'2026-11-09T07:00:00Z',planned_end:'2026-11-09T08:00:00Z',deadline:'2026-11-13T17:00:00Z',estimated_duration_minutes:60,production_attempt:1,sequence:10,generation:1,dependencies:[],locked:false,can_operate:true,external:false,source_status:'SALLE_CAO',assignment_explanation:{score:0.8,components:{qualification:1,workload:0.5}}});
+
+test('quality reason and optional detail retain a rejected draft without selecting inspection checks', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await session(page);
+  const order = caseOrder({ status: 'CONTROLE_QUALITE', status_label: 'Contrôle qualité final' });
+  const commands = [];
+  await mocks(page, path => path === '/api/prescriptions/' ? { results: [order], next: null } : undefined);
+  await page.route('**/api/prescriptions/*/command/', async route => {
+    const command = route.request().postDataJSON(); commands.push(command);
+    const passed = ['margins', 'contacts', 'shade', 'occlusion', 'cosmetic', 'glazing', 'polishing'].every(key => command.data.checks[key]);
+    await route.fulfill({ status: passed ? 200 : 400, json: passed ? { case: order, result: {} } : { detail: 'A failed inspection or gap requires photographic evidence.' }, headers: { 'Access-Control-Allow-Origin': '*' } });
+  });
+  await page.goto('/static/');
+  await page.getByRole('button', { name: 'Ouvrir la navigation', exact: true }).click();
+  await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click();
+  const dialog = await openClinical(page);
+  const reason = dialog.getByRole('combobox', { name: 'Notes et motif de l’action — motif prédéfini' });
+  await reason.selectOption('conform');
+  await dialog.getByLabel('Notes et motif de l’action', { exact: true }).fill('Vérification au poste qualité.');
+  expect(commands).toHaveLength(0);
+  await expect(dialog.getByRole('checkbox').first()).not.toBeChecked();
+  await dialog.getByRole('button', { name: 'Enregistrer le contrôle' }).click();
+  await expect(page.getByRole('alert')).toContainText('photo');
+  await expect(reason).toHaveValue('conform');
+  await expect(dialog.getByLabel('Notes et motif de l’action', { exact: true })).toHaveValue('Vérification au poste qualité.');
+  for (const label of ['Marges', 'Contacts', 'Teinte', 'Occlusion', 'Esthétique', 'Glaçage', 'Polissage']) await dialog.getByLabel(`${label} conforme`, { exact: true }).check();
+  await dialog.getByRole('button', { name: 'Enregistrer le contrôle' }).click();
+  await expect.poll(() => commands.length).toBe(2);
+  expect(commands[1].data.notes).toBe('Contrôle qualité : critères contrôlés et conformes.\nVérification au poste qualité.');
+  await expect(reason).toHaveValue('');
+  await expect(dialog.getByLabel('Notes et motif de l’action', { exact: true })).toHaveValue('');
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('cycle reason enables an explicit confirmation and free text remains available', async ({ page }) => {
+  await session(page);
+  const calls = []; let phase = 'CYCLE';
+  await planningMocks(page, (path, req, url, task) => {
+    Object.assign(task, { workflow_step: 'USINAGE_CNC', source_status: 'USINAGE_CNC', status: 'IN_PROGRESS', resource_phase: phase, setup_minutes: 10, unload_minutes: 10, title: 'Usinage CNC' });
+    if (path === '/api/prescriptions/') return { results: [caseOrder({ status: 'USINAGE_CNC', status_label: 'Usinage CNC' })], next: null };
+    if (path.endsWith('/command/') && req.method() === 'POST') { calls.push(req.postDataJSON()); phase = 'AWAITING_UNLOAD'; return { case: caseOrder(), result: {} }; }
+  });
+  await page.goto('/static/');
+  await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click();
+  const dialog = page.getByRole('dialog', { name: /Dossier clinique/ });
+  const confirm = dialog.getByRole('button', { name: 'Confirmer la fin réelle du cycle' });
+  await expect(confirm).toBeDisabled();
+  const reason = dialog.getByRole('combobox', { name: 'Commentaire de progression / motif du blocage — motif prédéfini' });
+  await reason.selectOption('cycle-finished');
+  await expect(confirm).toBeEnabled();
+  expect(calls).toHaveLength(0);
+  await confirm.click();
+  await expect.poll(() => calls.length).toBe(1);
+  expect(calls[0]).toMatchObject({ action: 'planning-cycle-finished', data: { notes: 'Cycle terminé, pièce encore dans l’équipement.', task: planningTask().id } });
+  await expect(dialog.getByRole('button', { name: 'Commencer le déchargement' })).toBeVisible();
+  await expect(reason).toHaveValue('');
+  await dialog.getByLabel('Commentaire de progression / motif du blocage', { exact: true }).fill('Situation exceptionnelle à expliquer.');
+  await dialog.getByRole('button', { name: 'Signaler un problème' }).click();
+  await expect.poll(() => calls.length).toBe(2);
+  expect(calls[1]).toMatchObject({ action: 'planning-block', data: { notes: 'Situation exceptionnelle à expliquer.' } });
+});
+
 async function planningMocks(page,handler){
   const task=planningTask();
   await mocks(page,async(path,req,url)=>{
@@ -278,9 +377,13 @@ test('supervised planning assignment carries UUID and reports an API conflict',a
   await page.route('**/api/planning/tasks/*/assign/',async route=>{payload=route.request().postDataJSON();key=route.request().headers()['idempotency-key'];await route.fulfill({status:400,json:{detail:'Conflit de réservation : employé déjà occupé.'},headers:{'Access-Control-Allow-Origin':'*'}});});
   await page.goto('/static/');await page.getByRole('button',{name:'Planning',exact:true}).click();await page.getByLabel('Date du planning').fill('2026-11-09');
   await page.getByTitle('PAT-TEST · Conception CAO · Technicien CAO',{exact:true}).click();
+  await page.getByRole('combobox',{name:'Motif de supervision — motif prédéfini'}).selectOption('priority');
+  await page.getByLabel('Motif de supervision',{exact:true}).fill('Cabinet disponible cet après-midi.');
   await page.getByRole('button',{name:'Affecter et verrouiller',exact:true}).click();
   await expect(page.getByRole('alert')).toContainText('Conflit de réservation');
   expect(payload.employee).toBe(1);expect(payload.start).toBe('2026-11-09T07:00:00.000Z');expect(key).toMatch(/^[0-9a-f-]{36}$/);
+  expect(payload.notes).toBe('Réaffectation pour respecter la priorité de livraison.\nCabinet disponible cet après-midi.');
+  await expect(page.getByLabel('Motif de supervision',{exact:true})).toHaveValue('Cabinet disponible cet après-midi.');
 });
 test('manufacturing task start and completion use existing case-command endpoint',async({page})=>{
   await session(page);const calls=[];
@@ -294,4 +397,96 @@ test('manufacturing task start and completion use existing case-command endpoint
   await page.goto('/static/');await page.getByRole('button',{name:'Commandes',exact:true}).first().click();await page.getByRole('button',{name:'Ouvrir le diagramme PAT-TEST'}).click();
   await page.getByRole('button',{name:'Démarrer',exact:true}).click();await page.getByRole('button',{name:'Terminer l’étape',exact:true}).click();
   await expect.poll(()=>calls.length).toBe(2);expect(calls.map(c=>c.action)).toEqual(['planning-start','planning-complete']);expect(calls[0].data.task).toBe(planningTask().id);
+});
+
+for (const width of [1440, 390]) {
+  test(`clinical checkpoint opens in a dialog with visible French feedback at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 740 });
+    await session(page);
+    const commands = [];
+    await mocks(page, path => path === '/api/prescriptions/' ? { results: [caseOrder({ status: 'CONTROLE_DOSSIER' })], next: null } : undefined);
+    await page.route('**/api/prescriptions/*/command/', async route => {
+      const command = route.request().postDataJSON(); commands.push(command);
+      await route.fulfill({ status: command.data.checks.hygiene ? 200 : 400,
+        json: command.data.checks.hygiene ? { case: caseOrder(), result: {} } : { detail: 'A failed inspection or gap requires photographic evidence.' },
+        headers: { 'Access-Control-Allow-Origin': '*' } });
+    });
+    await page.goto('/static/');
+    if (width < 650) await page.getByRole('button', { name: 'Ouvrir la navigation', exact: true }).click();
+    await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
+    await page.getByRole('button', { name: 'Ouvrir le diagramme PAT-TEST' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Dossier clinique — PAT-TEST' });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole('tab', { name: 'Contrôles et documents' })).toHaveAttribute('aria-selected', 'true');
+    for (const label of ['Absence de déformation', 'Absence de bulles', 'Limites lisibles', 'Occlusion'])
+      await dialog.getByLabel(label + ' conforme', { exact: true }).check();
+    await dialog.getByRole('button', { name: 'Enregistrer le contrôle' }).click();
+    const error = page.getByRole('alert');
+    await expect(error).toContainText('photo de preuve');
+    const bounds = await error.boundingBox();
+    expect(bounds.y).toBeLessThan(100);
+    expect(await error.evaluate(element => {
+      const rect = element.getBoundingClientRect();
+      return element.contains(document.elementFromPoint(rect.x + 10, rect.y + 10));
+    })).toBe(true);
+    await dialog.getByLabel('Hygiène conforme', { exact: true }).check();
+    await dialog.getByRole('button', { name: 'Enregistrer le contrôle' }).click();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await expect(page.locator('.app-notification').getByRole('status')).toContainText('Action enregistrée.');
+    expect(commands[1].data.checks.hygiene).toBe(true);
+    expect(commands[1].data.stage).toBe('PHYSICAL');
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: `test-results/clinical-dialog-${width}.png`, fullPage: true });
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await page.getByRole('button', { name: 'Ouvrir les documents et actions' }).click();
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: 'Ouvrir les documents et actions' })).toBeFocused();
+  });
+}
+
+test('courier scans each custody step explicitly and hides successful QR and PIN controls', async ({ page }) => {
+  await session(page, 'Coursier');
+  let order = caseOrder({ status: 'ATTENTE_RAMASSAGE' }); const commands = [];
+  await mocks(page, path => path === '/api/prescriptions/' ? { results: [order], next: null } : undefined);
+  await page.route('**/api/prescriptions/*/command/', async route => {
+    const command = route.request().postDataJSON(); commands.push(command);
+    const valid = command.action === 'confirm-delivery' ? command.data.pin === '0789' : command.data.qr_token === 'signed-token';
+    if (valid) order = { ...order, status: { pickup: 'EN_ROUTE_LABO', 'lab-deposit': 'A_CONFIRMER', 'confirm-delivery': 'LIVRE' }[command.action] };
+    await route.fulfill({ status: valid ? 200 : 400, json: valid ? { case: order, result: {} }
+      : { detail: command.action === 'confirm-delivery' ? 'Invalid delivery PIN.' : 'Invalid or expired QR code.' },
+    headers: { 'Access-Control-Allow-Origin': '*' } });
+  });
+  await page.goto('/static/');
+  await expect(page.getByLabel('Contenu du QR signé du dossier')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Confirmer la collecte', exact: true }).click();
+  await page.getByLabel('Contenu du QR signé du dossier').fill('bad-token');
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirmer la collecte', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Code QR invalide ou expiré');
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.getByLabel('Contenu du QR signé du dossier').fill('signed-token');
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirmer la collecte', exact: true }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByLabel('Contenu du QR signé du dossier')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Confirmer le dépôt au labo' })).toHaveCount(0);
+  expect(commands.filter(command => command.action === 'lab-deposit')).toHaveLength(0);
+  await page.getByRole('button', { name: 'Scanner à l’arrivée au laboratoire' }).click();
+  await expect(page.getByLabel('Contenu du QR signé du dossier')).toHaveValue('');
+  await page.getByLabel('Contenu du QR signé du dossier').fill('signed-token');
+  await page.getByRole('button', { name: 'Valider le QR d’arrivée' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  expect(commands.filter(command => command.action === 'lab-deposit')).toHaveLength(1);
+  // Separate delivery-stage fixture; pickup never silently grants delivery.
+  order = { ...order, status: 'EN_ROUTE_CABINET' };
+  await page.getByRole('button', { name: 'Actualiser les commandes' }).click();
+  await page.getByRole('button', { name: 'Confirmer la livraison', exact: true }).click();
+  await page.getByLabel('PIN réel de livraison').fill('0000');
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirmer la livraison', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('PIN');
+  await page.getByLabel('PIN réel de livraison').fill('0789');
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirmer la livraison', exact: true }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByLabel('PIN réel de livraison')).toHaveCount(0);
+  await expect(page.getByText('Livré', { exact: true })).toBeVisible();
 });

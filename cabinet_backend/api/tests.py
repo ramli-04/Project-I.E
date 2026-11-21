@@ -3,15 +3,36 @@ from rest_framework.test import APIClient
 from datetime import date, timedelta
 from .alerts import laboratory_alerts
 from .models import StockItem, StaffMember, Equipment
+import uuid
+from django_tenants.utils import schema_context
+from customers.models import PlatformAccount
+from .models import PartnerClinic, Prescription
+from .test_support import WorkflowFixtures
+from django.db import connection
 
 
-class ConfigurationTests(TenantTestCase):
+class ConfigurationTests(WorkflowFixtures, TenantTestCase):
     @classmethod
     def setup_tenant(cls, tenant):
         tenant.name = 'Test laboratory'
 
     def setUp(self):
+        super().setUp()
+        connection.set_tenant(self.tenant)
         self.client = APIClient(HTTP_HOST=self.get_test_tenant_domain())
+        with schema_context('public'):
+            self.manager = PlatformAccount.objects.create(name='Config manager', login_key='config-manager',
+                role='LAB', laboratory=self.tenant, workstation_role='MANAGER')
+            self.dentist = PlatformAccount.objects.create(name='Config dentist', login_key='config-dentist', role='DENTIST')
+        self.clinic = PartnerClinic.objects.create(name='Config clinic', pickup_address='Test street', platform_dentist=self.dentist)
+        self.client.force_authenticate(user=self.manager)
+        self.pins = {}
+
+    def test_anonymous_configuration_access_is_denied(self):
+        self.client.force_authenticate(user=None)
+        for endpoint in ('staff', 'equipment', 'stock', 'alerts', 'prescriptions'):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.client.get(f'/api/{endpoint}/').status_code, 401)
 
     def test_resource_lifecycle(self):
         resources = {
@@ -89,12 +110,18 @@ class ConfigurationTests(TenantTestCase):
         self.assertEqual(self.client.get('/api/alerts/', HTTP_HOST='unknown.localhost').status_code, 404)
 
     def create_order(self, impression='NUMERIQUE'):
-        response = self.client.post('/api/prescriptions/', {
+        self.client.force_authenticate(user=self.dentist)
+        response = self.client.post('/platform/dentist/orders/', {
             'patient_ref': 'QA-PROCESS', 'dentist_name': 'Cabinet test', 'tooth_number': 11,
             'shade': 'A2', 'material': 'Zircone', 'disinfected': True, 'impression_type': impression,
-        }, format='json')
+            'laboratory_id': self.tenant.schema_name, 'partner_clinic': self.clinic.pk,
+            'clinical_items': [{'tooth_number': 11, 'function': 'Couronne', 'form': 'Anatomique', 'shade': 'A2', 'material': 'Zircone'}],
+        }, format='json', HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()))
+        self.client.force_authenticate(user=self.manager)
         self.assertEqual(response.status_code, 201, response.data)
         order = response.data
+        self.assertNotIn('delivery_pin', order)
+        self.pins[order['id']] = order['delivery_pin_once']
         self.assertEqual(order['status'], 'DEMANDE_RECUE')
         accepted = self.client.patch(f'/api/prescriptions/{order["id"]}/', {'accepted': True}, format='json')
         self.assertEqual(accepted.status_code, 200, accepted.data)
@@ -109,27 +136,14 @@ class ConfigurationTests(TenantTestCase):
             with self.subTest(method=method):
                 order = self.create_order(impression)
                 self.assertEqual(order['status'], 'DEMANDE_RECUE')
-                self.assertEqual(len(order['delivery_pin']), 4)
-                url = f'/api/prescriptions/{order["id"]}/'
-                visited = []
-                while order['next_status']:
-                    visited.append(order['status'])
-                    payload = {'status': order['next_status']}
-                    if order['status'] == 'ANALYSE_DEMANDE':
-                        payload['analysis_validated'] = True
-                    if order['status'] == 'A_CONFIRMER':
-                        payload['reception_validated'] = True
-                    if order['status'] == 'PLANIFICATION':
-                        payload.update(production_method=method, delivery_date='2026-11-10', thermal_treatment='FRITTAGE' if method == 'CFAO' else 'AUCUN', status='MODELE_TRAVAIL' if method == 'CONVENTIONNEL' else 'SALLE_CAO')
-                    if order['status'] == 'CONTROLE_QUALITE':
-                        payload['quality_validated'] = True
-                    response = self.client.patch(url, payload, format='json')
-                    self.assertEqual(response.status_code, 200, response.data)
-                    order = response.data
-                self.assertEqual(order['status'], 'LIVRE')
+                self.assertEqual(len(self.pins[order['id']]), 4)
+                source = Prescription.objects.get(pk=order['id'])
+                visited = self.deliver_case(source, route=method, pin=self.pins[order['id']],
+                    thermal_treatment='FRITTAGE' if method == 'CFAO' else 'AUCUN')
+                self.assertEqual(source.status, 'LIVRE')
                 self.assertIn(required, visited)
                 self.assertNotIn(absent, visited)
-                self.assertEqual(len(order['workflow_history']), len(visited) + 1)
+                self.assertEqual(len(source.workflow_history), len(visited))
                 self.assertEqual('ATTENTE_RAMASSAGE' in visited, impression == 'PHYSIQUE')
 
     def test_workflow_guards(self):
@@ -141,6 +155,7 @@ class ConfigurationTests(TenantTestCase):
         self.assertEqual(self.client.patch(url, {'status': 'A_CONFIRMER', 'analysis_validated': True}, format='json').status_code, 200)
         self.assertEqual(self.client.patch(url, {'status': 'CONTROLE_DOSSIER'}, format='json').status_code, 400)
         self.assertEqual(self.client.patch(url, {'status': 'CONTROLE_DOSSIER', 'reception_validated': True}, format='json').status_code, 200)
+        self.passing_intake(Prescription.objects.get(pk=order['id']))
         self.assertEqual(self.client.patch(url, {'status': 'PLANIFICATION'}, format='json').status_code, 200)
         self.assertEqual(self.client.patch(url, {'status': 'SALLE_CAO', 'production_method': 'CFAO'}, format='json').status_code, 400)
         self.assertEqual(self.client.patch(url, {'status': 'SALLE_CAO', 'production_method': 'CFAO', 'delivery_date': '2026-11-10'}, format='json').status_code, 200)
@@ -160,10 +175,13 @@ class ConfigurationTests(TenantTestCase):
         self.assertIsNotNone(order['accepted_at'])
         self.assertEqual(self.client.patch(url, {'accepted': False}, format='json').status_code, 400)
         self.assertEqual(self.client.patch(url, {'is_paused': True}, format='json').status_code, 400)
-        response = self.client.patch(url, {'is_paused': True, 'pause_reason': 'Attente du cabinet', 'current_issues': 'Fichier incomplet'}, format='json')
+        source = Prescription.objects.get(pk=order['id'])
+        self.workflow_command(source, 'pause', {'paused': True, 'notes': 'Attente du cabinet'})
+        response = self.client.patch(url, {'current_issues': 'Fichier incomplet'}, format='json')
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(self.client.patch(url, {'status': 'ANALYSE_DEMANDE'}, format='json').status_code, 400)
-        resumed = self.client.patch(url, {'is_paused': False, 'status': 'ANALYSE_DEMANDE'}, format='json')
+        self.workflow_command(source, 'pause', {'paused': False})
+        resumed = self.client.patch(url, {'status': 'ANALYSE_DEMANDE'}, format='json')
         self.assertEqual(resumed.status_code, 200, resumed.data)
         persisted = self.client.get(url).data
         self.assertEqual(persisted['current_issues'], 'Fichier incomplet')
@@ -174,4 +192,7 @@ class ConfigurationTests(TenantTestCase):
         order = Prescription.objects.create(patient_ref='QA-RECEIVED', dentist_name='Cabinet', tooth_number=11, shade='A2', material='Zircone', disinfected=True)
         response = self.client.patch(f'/api/prescriptions/{order.pk}/', {'status': 'ANALYSE_DEMANDE'}, format='json')
         self.assertEqual(response.status_code, 400)
-        self.assertIn('accepted', response.data)
+        self.assertIn('Accept the case before advancing.', str(response.data))
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'DEMANDE_RECUE')
+        self.assertEqual(order.audit_history.count(), 1)

@@ -129,7 +129,7 @@ class PrescriptionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         if getattr(self, '_lock_prescription', False):
-            queryset = queryset.select_for_update(of=('self',))
+            queryset = queryset.select_for_update(of=('self',), no_key=True)
         return queryset
 
     def list(self, request, *args, **kwargs):

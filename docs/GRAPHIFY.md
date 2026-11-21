@@ -2,7 +2,7 @@
 
 Installed from https://github.com/Graphify-Labs/graphify.git at commit 0a8cd4e1e342235fe53e881fb5d591bf0460071f (Graphify 0.9.97).
 
-Run these commands in this project directory using PowerShell:
+Run these commands from the repository root (the parent of docs/) using PowerShell:
 
 ```powershell
 # Build the local code graph, with no external model or API key.

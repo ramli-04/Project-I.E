@@ -6,11 +6,23 @@ Gestion Labo connects dental laboratories, dental practices and couriers to foll
 
 The project was previously called **Cabinet 2.0**. Existing directory names and some backend labels retain that name.
 
-> **Development status:** the redesigned frontend includes a database-free preview and integrations for the current backend contracts. Live Django/PostgreSQL integration, remaining backend remediation and deployment validation are still pending. Passing the frontend tests does not establish production readiness.
+> **Development status:** the isolated Docker demo runs the real Django/PostgreSQL workflow, tenant authentication, background tasks, technician/machine phases and monthly statements. Guided case MY-TEST-001 reached clinical closure and its statement on 21 November 2026. Device adapters and production deployment validation remain pending. Current verification evidence is in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
+
+## Present the complete demo
+
+Follow [DEMO_GUIDE.md](DEMO_GUIDE.md) for setup, credentials, a short presentation of the completed case, and a complete fresh-case walkthrough from prescription to delivery, fitting and billing. The `demo/` folder provides a synthetic STL and a simulation-only signed-QR helper. Start the real demo with `docker compose -f compose.demo.yml up -d --build`, then open **http://localhost:18080**.
+
+Get the demo handoff branch from the contributor repository:
+
+```powershell
+git clone --branch feat/virtual-lab-demo --single-branch https://github.com/ramli-04/Project-I.E.git GestionLaboDemo
+cd GestionLaboDemo
+docker compose -f compose.demo.yml up -d --build
+```
 
 ## Quick start: preview without a database
 
-For an isolated Docker environment using the **real Django/PostgreSQL API** and synthetic fixtures, see [DEMO_GUIDE.md](DEMO_GUIDE.md) and [VIRTUAL_LAB_PLAN.md](VIRTUAL_LAB_PLAN.md). The first milestone establishes reproducible setup; connected virtual-machine events and separate human/machine scheduling follow in later steps.
+For the **real Django/PostgreSQL API** with synthetic fixtures, use [DEMO_GUIDE.md](DEMO_GUIDE.md). The preview below is for read-only UI exploration. The implementation roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 Requires Node.js and npm. From the repository root:
 
@@ -129,7 +141,7 @@ if (-not (Test-Path '.env')) {
 
 ### 3. Check and initialize a development database
 
-Use a fresh, empty PostgreSQL development database, or follow the backup/restore instructions in [`OTHER_PC_SETUP.md`](OTHER_PC_SETUP.md). Do not bootstrap over a restored installation.
+Use a fresh, empty PostgreSQL development database, or follow the backup/restore instructions in [`docs/INSTALLATION.md`](docs/INSTALLATION.md). Do not bootstrap over a restored installation.
 
 ```powershell
 cd cabinet_backend
@@ -196,7 +208,7 @@ Accepted orders generate tasks from their applicable workflow. The deterministic
 
 Planning uses PostgreSQL and the existing Celery outbox. The database-free preview keeps this page available with an explicit empty state; it does not calculate real assignments. Production progress continues to require the existing design, inspection, inventory and QR/PIN evidence.
 
-For a development database, migration **`api.0024_production_planning`** is additive and installs `btree_gist` in `public` for reservation exclusion constraints. The migration account needs permission to install that extension. Apply tenant migrations and rebuild the workers after installing this code:
+Migration **`api.0024_production_planning`** installs `btree_gist` for reservation exclusions; **`api.0025_equipment_resource_phases`** adds PostgreSQL 14+ multirange employee windows and retained machine holds. The migration account needs the required extension/DDL permissions. Apply reviewed tenant migrations and rebuild workers together:
 
 ```powershell
 cd cabinet_backend
@@ -207,9 +219,9 @@ docker compose up -d --build celery_worker celery_beat
 
 In **Planning → Paramètres et équipe**, configure laboratory hours, production rules, mandatory qualifications and personnel. Then use **Replanifier** to enqueue existing accepted orders for synchronization. This also backfills eligible tasks for orders that predate the planning module. Keep Redis, the worker and Beat running for automatic recalculation and outbox recovery.
 
-The first version reserves continuous, non-preemptive slots within a configurable horizon and recalculates movable tasks across the laboratory. A task longer than every available continuous window remains blocked. Future assignments are provisional until business prerequisites are satisfied. The interface uses timezone transitions supplied by the backend to keep browser displays and manual inputs consistent with the scheduler's Africa/Casablanca rules.
+Manual tasks reserve continuous attended slots; explicitly autonomous equipment tasks reserve technicians for setup and unloading while holding the machine throughout its cycle. The scheduler recalculates movable forecasts within the configured horizon and preserves active/locked work. Future assignments are provisional until business prerequisites are satisfied. The interface uses timezone transitions supplied by the backend to keep browser displays and manual inputs consistent with the scheduler's Africa/Casablanca rules.
 
-See [Planning implementation](PLANNING_IMPLEMENTATION.md) for the audit, assumptions, API, migration details, file list and verification results.
+See [Planning implementation](docs/PLANNING.md) for the audit, assumptions, API, migration details, file list and verification results.
 
 ## Workflow and API
 
@@ -254,7 +266,7 @@ npm.cmd run build
 
 The browser test configuration starts Vite on port 5173, or reuses the server already there. These tests mock the API and do not require a database.
 
-Frontend planning verification includes Node contract/timezone tests and Chromium tests for calendar data, filters, Gantt, workload, assignment errors and manual progression. The browser tests use API fixtures; they do not establish live browser-to-Django integration. Current executed counts and backend regression comparison are recorded in [Planning implementation](PLANNING_IMPLEMENTATION.md). Oxlint reports one existing App fetch-effect warning.
+Frontend planning verification includes Node contract/timezone tests and Chromium tests for calendar data, filters, Gantt, workload, assignment errors and manual progression. The browser tests use API fixtures; they do not establish live browser-to-Django integration. Current executed counts and backend regression comparison are recorded in [test results](docs/TEST_RESULTS.md). Oxlint reports one existing App fetch-effect warning.
 
 Backend verification requires PostgreSQL and permission to create a separate disposable test database. With native database configuration set, from `cabinet_backend`:
 
@@ -265,7 +277,7 @@ Backend verification requires PostgreSQL and permission to create a separate dis
 & '..\.venv\Scripts\python.exe' manage.py test api customers --noinput
 ```
 
-Full backend regression, live frontend/backend verification and deployment remain pending; see the handoff for known fixture and consistency work.
+Dated backend and real API/browser verification is recorded in [test results](docs/TEST_RESULTS.md). Use the separate verification project in the demo guide for live browser checks. Native and production deployment validation remain separate work.
 
 ## Build frontend assets
 
@@ -281,35 +293,31 @@ Copy-Item -Path '.\cabinet_frontend\dist\*' -Destination '.\cabinet_backend\fron
 
 The build uses the `/static/` base path. Generated bundles are ignored by Git and must be rebuilt after source changes. Serving them through Django also requires suitable static-file configuration.
 
-`run_server.py` and `Cabinet2.spec` are legacy launcher/packaging files. The old SQLite portable-application instructions do not describe the current PostgreSQL/tenant setup; that packaging path has not been revalidated for it.
+Supported entrypoints are Django `manage.py`, Vite and the Compose services. The unvalidated legacy Windows EXE launcher/packager has been removed.
 
 ## Project structure
 
 ```text
 Project-I.E/
-├── cabinet_frontend/
-│   ├── src/                 # Portals, lab dashboard, stock/finance/workflow UI
-│   │   └── api/             # Tenant/platform clients, contracts and preview adapter
-│   ├── public/              # Shared website logo and browser favicon
-│   ├── tests/               # Playwright browser tests
-│   └── package.json
-├── cabinet_backend/
-│   ├── api/                 # Tenant workflow, evidence, stock, finance and tasks
-│   ├── customers/           # Tenant registry, platform accounts and authentication
-│   ├── cabinet_backend/     # Django/Celery settings
-│   ├── frontend_build/      # Generated assets, ignored by Git
-│   ├── requirements.txt
-│   └── manage.py
-├── docker-compose.yml       # Redis, Celery worker and Beat
-├── .env.example             # Compose database configuration template
-├── FRONTEND_INTEGRATION.md
-├── MODEL_HANDOFF.md
-└── README.md
+|-- cabinet_frontend/        # React portals, API clients, browser/unit tests
+|-- cabinet_backend/         # Django apps, tenant migrations and task workers
+|-- demo/                    # Synthetic STL and read-only signed-QR helper
+|-- docs/                    # Architecture, installation, roadmap and test report
+|-- compose.demo.yml         # Isolated real-API synthetic environment
+|-- compose.verify.yml       # Separate real-browser verification override
+|-- docker-compose.yml       # Native-development Redis/worker/Beat services
+|-- .env.example             # Local native-infrastructure configuration template
+|-- AGENTS.md                # Repository collaboration/Graphify instructions
+|-- graphify.cmd             # Isolated local graph tool wrapper
+|-- DEMO_GUIDE.md            # Complete audience walkthrough
+`-- README.md
 ```
 
 ## Data and deployment notes
 
 Credentials, database exports, `.runtime/`, `private_media/`, virtual environments and generated assets are excluded from Git. Source clones do not include the database, uploaded files or account passwords. Preserve the signing key when transferring an existing installation so its signed QR labels remain valid.
+
+An optional `memory.md` checkpoint stays local and is ignored; the maintained handoff is in `docs/` and `DEMO_GUIDE.md`.
 
 Patient references are entered manually; they are not automatically anonymized. Review the remaining backend consistency, database-role, tenant migration and deployment work before using real clinical data.
 
@@ -317,15 +325,4 @@ The overview loads all API pages and paginates its display locally. Planning tas
 
 ## Further documentation
 
-| Document | Purpose |
-| --- | --- |
-| [Frontend integration](FRONTEND_INTEGRATION.md) | Implemented UI, preview mode and validation scope |
-| [Model handoff](MODEL_HANDOFF.md) | Backend checkpoint, open remediation and deployment caveats |
-| [Other-PC setup](OTHER_PC_SETUP.md) | Database/private-file transfer and detailed Windows setup |
-| [BPMN progress](BPMN_IMPLEMENTATION_PROGRESS.md) | Workflow remediation progress |
-| [Inventory workflow](INVENTORY_WORKFLOW.md) | Stock ledger and loss-classification rules |
-| [Billing analytics](BILLING_ANALYTICS.md) | Billing catalogue implementation |
-| [Graphify setup](GRAPHIFY.md) | Local codebase knowledge graph |
-| [Planning implementation](PLANNING_IMPLEMENTATION.md) | Production planning, manual progress, migrations and test results |
-
-The transfer/handoff documents contain historical repository and branch names. Use the clone command in this README for the current `ramli-04/Project-I.E` repository. Older entries in `memory.md` describe previous iterations and may differ from the current code.
+Use the [documentation index](docs/README.md) for maintained architecture, installation, planning, inventory, billing, test results, roadmap and Graphify notes. The [demo guide](DEMO_GUIDE.md) remains the complete presenter walkthrough. Superseded implementation snapshots and duplicate handoff reports have been consolidated into these documents.

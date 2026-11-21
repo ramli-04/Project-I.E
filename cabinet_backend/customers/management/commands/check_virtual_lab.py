@@ -41,12 +41,13 @@ class Command(BaseCommand):
         self.stdout.write('PASS: seed rerun preserves case progress, status history and passwords.')
 
         base = os.environ.get('DEMO_API_URL', 'http://backend:8000').rstrip('/')
+        frontend_origin = os.environ.get('DEMO_FRONTEND_ORIGIN', 'http://localhost:18080').rstrip('/')
         def request(path, *, data=None, token=None, tenant=False, origin=False):
             headers = {'Host': 'simlab.localhost' if tenant else 'localhost'}
             if token:
                 headers['Authorization'] = 'Bearer ' + token
             if origin:
-                headers['Origin'] = 'http://localhost:18080'
+                headers['Origin'] = frontend_origin
             if data is not None:
                 headers['Content-Type'] = 'application/json'
             req = Request(base + path, data=None if data is None else json.dumps(data).encode(), headers=headers)
@@ -75,7 +76,7 @@ class Command(BaseCommand):
                 status, payload, headers = request(path, token=token, tenant=True, origin=True)
                 if status != 200:
                     raise CommandError(f'Real API check failed: {path}, HTTP{status}')
-                if headers.get('Access-Control-Allow-Origin') != 'http://localhost:18080':
+                if headers.get('Access-Control-Allow-Origin') != frontend_origin:
                     raise CommandError('Frontend CORS origin was not accepted.')
             status, _, _ = request('/api/planning/tasks/', token=token)
             if status not in {401, 403}:

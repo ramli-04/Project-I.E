@@ -60,7 +60,7 @@ class Command(BaseCommand):
 
         from api.models import EmployeeProfile, Machine, PartnerClinic
         from api.planning_models import EmployeeQualification, PlanningSettings
-        from api.planning import recalculate
+        from api.planning import recalculate, lock_resources, resources_changed, DEFAULT_RULES
         with tenant_context(lab):
             for name, role, workstation in specifications:
                 if role != 'LAB' or workstation == 'MANAGER':
@@ -89,6 +89,23 @@ class Command(BaseCommand):
                     'IMPRESSION_3D': {'qualifications': ['demo-print']},
                     'USINAGE_CNC': {'qualifications': ['demo-cnc']}},
             })
+            # Versioned synthetic capability upgrade: preserve operator choices,
+            # active task snapshots and all case/audit history on repeated startup.
+            with transaction.atomic():
+                anchor=lock_resources()
+                config=PlanningSettings.objects.get(pk=1)
+                changed=False
+                for step in ['IMPRESSION_3D','USINAGE_CNC','TRAITEMENT_THERMIQUE','FRITTAGE_9H']:
+                    rule=config.step_rules.setdefault(step,{})
+                    if 'unattended' not in rule:
+                        rule.setdefault('setup_minutes',10)
+                        rule.setdefault('unload_minutes',10)
+                        rule['unattended']=rule.get('duration',DEFAULT_RULES[step][1]) > rule['setup_minutes']+rule['unload_minutes']
+                        changed=True
+                if changed:
+                    config.save(update_fields=['step_rules','updated_at'])
+                    resources_changed('demo-bootstrap',kind='DEMO_PHASE_RULES_INITIALIZED',
+                        anchor=anchor,resources_locked=True)
             clinic, _ = PartnerClinic.objects.get_or_create(name='SIMULATION Clinic', defaults={
                 'pickup_address': 'Synthetic address — presentation data only', 'contact_phone': '0000000000',
                 'contact_email': 'demo@example.invalid', 'platform_dentist': accounts['Demo Dentist'],

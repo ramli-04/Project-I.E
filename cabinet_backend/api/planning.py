@@ -3,6 +3,8 @@
 Planning reservations are serialized by a tenant advisory lock. This service never
 locks or writes a prescription while holding only that lock: source commands lock
 their prescription first, and scheduling only reads source state (no reverse lock).
+Source writers use FOR NO KEY UPDATE: this still serializes changes but allows
+deferred FK validation of planning rows while another writer waits for planning.
 """
 from __future__ import annotations
 
@@ -13,12 +15,14 @@ from zoneinfo import ZoneInfo
 
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .models import EmployeeProfile, Machine, Prescription
 from .planning_models import (ACTIVE_BOOKINGS, EmployeeAvailability, PlanningEvent,
-                              PlanningSettings, PlanningTask)
+                              PlanningSettings, PlanningTask, EQUIPMENT_PHASES)
+from .planning_phases import (attended_intervals,
+                              equipment_slot, phase_bookings, validate_attended)
 from .workflow import LABELS, next_status, workflow_steps
 
 TZ = ZoneInfo('Africa/Casablanca')
@@ -61,9 +65,14 @@ def configuration():
 def rule(step, settings):
     role, duration, machine = DEFAULT_RULES.get(step, ('EXTERNAL', 15, ''))
     extra = settings.step_rules.get(step, {})
+    machine = extra.get('machine_type', machine)
+    unattended = extra.get('unattended', False)
     return {'required_role': role, 'estimated_duration_minutes': extra.get('duration', duration),
             'required_qualifications': extra.get('qualifications', []),
-            'machine_type': extra.get('machine_type', machine), 'workstation': role}
+            'machine_type': machine, 'workstation': role,
+            'resource_phase': 'PLANNED' if unattended else 'MANUAL',
+            'setup_minutes': extra.get('setup_minutes', 10),
+            'unload_minutes': extra.get('unload_minutes', 10)}
 
 
 def priority(order):
@@ -77,7 +86,7 @@ def finish_clock(task, now):
     task.actual_duration_minutes = math.ceil(task.worked_seconds / 60)
 
 
-def sync_order(order, actor='system'):
+def sync_order(order, actor='system', *, previous_status=None, allow_unstarted_cancel=False):
     """Called explicitly after a validated source save, inside its transaction."""
     lock_planning()
     if not order.accepted:
@@ -85,6 +94,16 @@ def sync_order(order, actor='system'):
     settings = configuration()
     now = timezone.now()
     tasks = list(order.planning_tasks.order_by('generation').prefetch_related('dependencies'))
+    for task in tasks:
+        if (not allow_unstarted_cancel and task.resource_phase == 'PLANNED'
+            and task.workflow_step == previous_status and order.status != previous_status
+            and task.production_attempt == order.production_attempt and task.intake_revision == order.intake_revision):
+            raise ValidationError('Cette étape utilise un cycle autonome : démarrez le chargement et confirmez le déchargement via le planning.')
+        if task.resource_phase in EQUIPMENT_PHASES and (
+            order.status != task.workflow_step or order.production_attempt != task.production_attempt
+            or order.intake_revision != task.intake_revision
+        ):
+            raise ValidationError('Confirmez le déchargement de l’équipement avant de changer d’étape ou de tentative.')
     if order.status == 'CLOTURE':
         for task in tasks:
             if task.status not in TERMINAL:
@@ -153,11 +172,12 @@ def request_replan(order, reason='source-change'):
     return enqueue_event(order, 'PLANNING', f'planning:{reason}:{order.pk}:{uuid.uuid4()}')
 
 
-def source_saved(order):
+def source_saved(order, previous=None):
     if order.accepted:
-        from .signals import _audit_details
+        from .signals import _audit_details, _workflow_metadata
         actor = _audit_details.get()[0]
-        sync_order(order, actor)
+        sync_order(order, actor, previous_status=previous['status'] if previous else None,
+                   allow_unstarted_cancel=_workflow_metadata.get().get('action') == 'REWORK')
         request_replan(order)
 
 
@@ -176,7 +196,7 @@ def lock_resources():
     Creating a durable outbox row takes a foreign-key lock on its prescription.
     Reversing this order could deadlock with a concurrent source command.
     """
-    anchor = Prescription.objects.select_for_update().filter(accepted=True).exclude(status='CLOTURE').order_by('pk').first()
+    anchor = Prescription.objects.select_for_update(no_key=True).filter(accepted=True).exclude(status='CLOTURE').order_by('pk').first()
     lock_planning()
     return anchor
 
@@ -249,18 +269,12 @@ def overlap(start, end, a, b):
 
 
 def reservations(tasks, now):
-    result = []
-    for t in tasks:
-        if t.planned_start and t.planned_end and t.status in ACTIVE_BOOKINGS:
-            end = t.planned_end
-            if t.status in {'IN_PROGRESS', 'PAUSED'}:
-                remaining = max(15, t.estimated_duration_minutes - t.actual_duration_minutes)
-                end = max(end, now + timedelta(minutes=remaining))
-            result.append((t.assigned_employee_id, t.machine_id, t.machine_slot, t.planned_start, end, t.pk))
-    return result
+    return phase_bookings(tasks, now)
 
 
 def slot_for(employee, task, machine, machine_slot, earliest, settings, bookings):
+    if task.resource_phase == 'PLANNED':
+        return equipment_slot(employee,task,machine,machine_slot,earliest,settings,bookings) if machine else None
     duration = timedelta(minutes=task.estimated_duration_minutes)
     first_day = earliest.astimezone(TZ).date()
     horizon = timezone.localdate(timezone.now(), TZ) + timedelta(days=settings.horizon_days)
@@ -272,9 +286,10 @@ def slot_for(employee, task, machine, machine_slot, earliest, settings, bookings
             blocked = sorted((a,b) for emp,mid,slot,a,b,pk in bookings if pk != task.pk
                 and (emp == employee.pk or (machine and mid == machine.pk and slot == machine_slot)))
             for a,b in blocked:
+                if start > end-duration: break
                 if start + duration <= a: break
                 if overlap(start, start + duration, a, b): start = b
-            if start + duration <= end and qualified(employee, task, start + duration):
+            if start <= end-duration and qualified(employee, task, start + duration):
                 return start, start + duration
         day += timedelta(days=1)
     return None
@@ -301,14 +316,17 @@ def interval_valid(task, employee, start, end, settings, bookings, machine=None,
         raise ValidationError('Le créneau est trop court pour la durée estimée.')
     if not qualified(employee, task, end):
         raise ValidationError('Employé indisponible, rôle ou qualifications obligatoires manquants/expirés.')
-    if not any(a <= start and end <= b for a,b in employee_windows(employee, start.astimezone(TZ).date(), settings)):
+    if task.resource_phase == 'PLANNED':
+        validate_attended(task,employee,start,end,settings,bookings)
+    elif not any(a <= start and end <= b for a,b in employee_windows(employee, start.astimezone(TZ).date(), settings)):
         raise ValidationError('Le créneau est hors horaire ou recouvre une absence/pause.')
     if task.machine_type and (not machine or machine.machine_type != task.machine_type):
         raise ValidationError('Un équipement du type requis est obligatoire.')
     if machine and (machine.status != 'ACTIF' or not 1 <= machine_slot <= machine.capacity):
         raise ValidationError('Équipement indisponible ou capacité dépassée.')
     for emp,mid,slot,a,b,pk in bookings:
-        if pk != task.pk and overlap(start,end,a,b) and (emp == employee.pk or (machine and mid == machine.pk and slot == machine_slot)):
+        employee_conflict = emp == employee.pk and any(overlap(x,y,a,b) for x,y in attended_intervals(task,start,end))
+        if pk != task.pk and (employee_conflict or (overlap(start,end,a,b) and machine and mid == machine.pk and slot == machine_slot)):
             raise ValidationError('Conflit de réservation : employé ou équipement déjà occupé.')
     for dep in task.dependencies.all():
         if dep.status != 'COMPLETED' and (not dep.planned_end or dep.planned_end > start):
@@ -326,7 +344,7 @@ def recalculate(*, actor='system', now=None):
         raise ValidationError('Planning trop volumineux : réduire le périmètre avant le recalcul.')
     employees = list(EmployeeProfile.objects.select_related('user','platform_account').prefetch_related('planning_qualifications','planning_availability').order_by('pk'))
     machines = list(Machine.objects.filter(status='ACTIF').order_by('pk'))
-    protected = [t for t in tasks if t.locked or t.status in {'IN_PROGRESS','PAUSED'} or t.manual_block]
+    protected = [t for t in tasks if t.locked or t.status in {'IN_PROGRESS','PAUSED'} or t.manual_block or t.resource_phase in EQUIPMENT_PHASES]
     mutable = [t for t in tasks if t not in protected]
     old = {t.pk: (t.assigned_employee_id, t.planned_start, t.planned_end) for t in mutable}
     # Release movable reservations together before rebuilding them under the tenant lock.
@@ -342,6 +360,21 @@ def recalculate(*, actor='system', now=None):
     bookings = reservations(protected, now)
     employee_by_id = {e.pk:e for e in employees}
     for task in protected:
+        if task.resource_phase in EQUIPMENT_PHASES:
+            # Actual holds never expire; changed resources remain visible to staff.
+            if not task.manual_block:
+                reason = ''
+                if not task.machine or task.machine.status != 'ACTIF' or task.machine_slot > task.machine.capacity:
+                    reason = 'Équipement indisponible ou capacité modifiée ; réservation conservée jusqu’au déchargement.'
+                elif task.resource_phase in {'SETUP','UNLOADING'}:
+                    try:
+                        validate_attended(task,employee_by_id[task.assigned_employee_id],now,
+                            now+timedelta(minutes=1),settings,bookings,duration=1)
+                    except (ValidationError,KeyError) as exc:
+                        reason = 'Phase manuelle en conflit ; réservation conservée : '+str(exc)
+                task.blocking_reason = reason
+                task.save(update_fields=['blocking_reason','updated_at'])
+            continue
         if task.planned_start and task.assigned_employee_id and not task.manual_block:
             try:
                 interval_valid(task, employee_by_id[task.assigned_employee_id], task.planned_start,
@@ -368,6 +401,7 @@ def recalculate(*, actor='system', now=None):
             reason = ''
             if order.is_paused: reason = order.pause_reason or 'Commande en pause.'
             elif task.workflow_step in EXTERNAL: reason = 'Validation ou commande métier externe requise : ' + task.title
+            elif any(d.resource_phase in EQUIPMENT_PHASES for d in waiting): reason = 'Déchargement de l’équipement préalable non confirmé.'
             elif any(not d.planned_end for d in waiting): reason = 'Dépendance bloquée ou validation externe en attente.'
             elif order.delivery_service == 'NEXT_DAY' and order.total_price is None and task.sequence > 10: reason = 'Devis manuel J+1 non validé.'
             earliest = max([now, *[d.planned_end for d in waiting if d.planned_end]])
@@ -396,7 +430,7 @@ def recalculate(*, actor='system', now=None):
                 task.assignment_mode = 'AUTO'
                 task.assignment_explanation = {'score':-neg_score,'components':components,'weights':settings.weights,
                     'policy':'urgence, marge avant échéance, contraintes strictes, score pondéré, identifiants stables'}
-                bookings.append((employee.pk,machine.pk if machine else None,slot,start,end,task.pk))
+                bookings.extend(reservations([task],now))
             task.save()
             if old[task.pk] != (task.assigned_employee_id,task.planned_start,task.planned_end):
                 changed += 1
@@ -459,7 +493,7 @@ def task_command(order, command, data, actor, role):
     supervision = {'planning-assign','planning-reschedule','planning-lock','planning-estimate'}
     if command in supervision:
         if role != 'MANAGER': raise ValidationError('Action réservée au responsable du laboratoire.')
-        if task.status in {'IN_PROGRESS','PAUSED'}: raise ValidationError('Ne déplacez pas une tâche déjà commencée ; suspendez/résolvez son exécution.')
+        if task.status in {'IN_PROGRESS','PAUSED'} or task.resource_phase in EQUIPMENT_PHASES: raise ValidationError('Ne déplacez pas une tâche déjà commencée ; suspendez/résolvez son exécution.')
         if command == 'planning-lock':
             if type(data.get('locked')) is not bool: raise ValidationError('locked doit être un booléen.')
             if data['locked'] and not task.planned_start: raise ValidationError('Planifiez la tâche avant de la verrouiller.')
@@ -502,11 +536,71 @@ def task_command(order, command, data, actor, role):
             if task.status == 'IN_PROGRESS': raise ValidationError('Tâche déjà démarrée.')
             if order.is_paused: raise ValidationError('Reprenez d’abord la commande via la commande métier de pause.')
             if not task.assigned_employee_id: raise ValidationError('Affectez un collaborateur qualifié avant de démarrer.')
+            if 'start_now' in data and type(data['start_now']) is not bool:
+                raise ValidationError('start_now doit être un booléen.')
+            if data.get('start_now') and (role != 'MANAGER' or not data.get('notes','').strip()):
+                raise ValidationError('Démarrage supervisé : responsable du laboratoire et motif requis.')
+            if task.planned_start and task.planned_start > now:
+                if not (role == 'MANAGER' and data.get('start_now') is True and data.get('notes','').strip()):
+                    raise ValidationError('Créneau futur : attendez le début prévu ou demandez une replanification au responsable.')
             employee = EmployeeProfile.objects.select_related('user','platform_account').prefetch_related('planning_availability','planning_qualifications').get(pk=task.assigned_employee_id)
+            if task.resource_phase in EQUIPMENT_PHASES:
+                if command != 'planning-resume': raise ValidationError('Cycle déjà commencé.')
+                if task.resource_phase in {'SETUP','UNLOADING'}:
+                    duration = task.setup_minutes if task.resource_phase == 'SETUP' else task.unload_minutes
+                    validate_attended(task,employee,now,now+timedelta(minutes=duration),settings,
+                        reservations(PlanningTask.objects.exclude(pk=task.pk),now),duration=duration)
+                    task.last_started_at = now
+                task.status,task.manual_block,task.blocking_reason = 'IN_PROGRESS',False,''
+                task.save()
+                event('PHASE_RESUMED',actor,task=task,phase=task.resource_phase)
+                request_replan(order,command)
+                return {'task_id':str(task.pk),'status':task.status,'resource_phase':task.resource_phase}
             end = now + timedelta(minutes=task.estimated_duration_minutes)
-            interval_valid(task,employee,now,end,settings,reservations(PlanningTask.objects.exclude(pk=task.pk),now),task.machine,task.machine_slot)
+            others = PlanningTask.objects.exclude(pk=task.pk)
+            protected_filter = Q(locked=True) | Q(manual_block=True) | Q(status__in=['IN_PROGRESS', 'PAUSED']) | Q(resource_phase__in=EQUIPMENT_PHASES)
+            protected = others.filter(protected_filter)
+            if task.resource_phase == 'PLANNED':
+                interval = equipment_slot(employee,task,task.machine,task.machine_slot,now,settings,reservations(protected,now)) if task.machine else None
+                if not interval or interval[0] != now:
+                    raise ValidationError('Chargement indisponible maintenant : horaire, qualification ou réservation protégée.')
+                _,end = interval
+            interval_valid(task,employee,now,end,settings,reservations(protected,now),task.machine,task.machine_slot)
+            # A delayed start shifts the interval into the next automatic booking.
+            # Release only movable reservations under the tenant lock, then rebuild
+            # around the actual execution. A failed command rolls everything back.
+            others.exclude(protected_filter).exclude(status__in=TERMINAL).update(
+                planned_start=None, planned_end=None)
             task.status,task.actual_start,task.last_started_at = 'IN_PROGRESS',task.actual_start or now,now
             task.planned_start,task.planned_end,task.manual_block,task.blocking_reason = now,end,False,''
+            if task.resource_phase == 'PLANNED':
+                task.resource_phase,task.phase_started_at = 'SETUP',now
+            task.save()
+            recalculate(actor=actor, now=now)
+            task.refresh_from_db()
+        elif command in {'planning-launch-cycle','planning-cycle-finished','planning-begin-unload'}:
+            if task.status != 'IN_PROGRESS': raise ValidationError('Reprenez la tâche avant de changer de phase.')
+            if command == 'planning-launch-cycle':
+                if task.resource_phase != 'SETUP': raise ValidationError('Le chargement doit être en cours.')
+                if task.machine.status != 'ACTIF': raise ValidationError('Équipement indisponible.')
+                finish_clock(task,now)
+                task.resource_phase,task.cycle_started_at = 'CYCLE',now
+            elif command == 'planning-cycle-finished':
+                if task.resource_phase != 'CYCLE': raise ValidationError('Aucun cycle autonome en cours.')
+                if not data.get('notes','').strip(): raise ValidationError('Confirmez la fin réelle du cycle dans le commentaire.')
+                task.resource_phase,task.cycle_completed_at = 'AWAITING_UNLOAD',now
+            else:
+                if task.resource_phase != 'AWAITING_UNLOAD': raise ValidationError('Confirmez d’abord la fin réelle du cycle.')
+                employee = EmployeeProfile.objects.select_related('user','platform_account').prefetch_related('planning_availability','planning_qualifications').get(pk=task.assigned_employee_id)
+                others = PlanningTask.objects.exclude(pk=task.pk)
+                protected_filter = Q(locked=True) | Q(manual_block=True) | Q(status__in=['IN_PROGRESS','PAUSED']) | Q(resource_phase__in=EQUIPMENT_PHASES)
+                validate_attended(task,employee,now,now+timedelta(minutes=task.unload_minutes),settings,
+                    reservations(others.filter(protected_filter),now),duration=task.unload_minutes)
+                others.exclude(protected_filter).exclude(status__in=TERMINAL).update(planned_start=None,planned_end=None)
+                task.resource_phase,task.last_started_at = 'UNLOADING',now
+            task.phase_started_at = now
+            task.save()
+            recalculate(actor=actor,now=now)
         elif command in {'planning-pause','planning-block'}:
             if not str(data.get('notes','')).strip(): raise ValidationError('Un motif est obligatoire.')
             if command == 'planning-pause' and task.status != 'IN_PROGRESS': raise ValidationError('Seule une tâche en cours peut être mise en pause.')
@@ -515,6 +609,12 @@ def task_command(order, command, data, actor, role):
             task.manual_block = True
         elif command == 'planning-complete':
             if task.status != 'IN_PROGRESS': raise ValidationError('Démarrez la tâche avant de la terminer.')
+            if task.resource_phase not in {'MANUAL','UNLOADING'}:
+                raise ValidationError('Confirmez le cycle puis le déchargement avant de terminer l’étape.')
+            if task.resource_phase == 'UNLOADING':
+                finish_clock(task,now)
+                task.resource_phase,task.unloaded_at = 'FINISHED',now
+                task.save()
             target = next_status(order)
             if not target: raise ValidationError('Aucune transition suivante disponible.')
             # These remain the SAME business guard and audit context as all other transitions.
@@ -523,11 +623,15 @@ def task_command(order, command, data, actor, role):
             order.save()
             task.refresh_from_db()
         else: raise ValidationError('Commande de planning inconnue.')
-    task.save()
+    # Completion is persisted by source_saved/sync_order. Re-saving it changes
+    # auto_now timestamps and correctly trips the immutable-task SQL trigger.
+    if task.status not in TERMINAL:
+        task.save()
     event(command.upper().replace('-','_'),actor,task=task,notes=str(data.get('notes','')),
           old_source_status=old_source_status,old_task_status=old_task_status,
           source_status=order.status,task_status=task.status,employee=task.assigned_employee_id,
+          resource_phase=task.resource_phase,
           start=task.planned_start.isoformat() if task.planned_start else None,
           end=task.planned_end.isoformat() if task.planned_end else None)
     request_replan(order,command)
-    return {'task_id':str(task.pk),'status':task.status}
+    return {'task_id':str(task.pk),'status':task.status,'resource_phase':task.resource_phase}

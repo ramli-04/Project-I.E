@@ -91,7 +91,7 @@ def recalculate_planning_task(tenant_schema_name, prescription_id, outbox_id=Non
     tenant = active_tenant(tenant_schema_name)
     with tenant_context(tenant), transaction.atomic():
         # Same lock order as source writes: source before the planning lock.
-        order = Prescription.objects.select_for_update().get(pk=prescription_id)
+        order = Prescription.objects.select_for_update(no_key=True).get(pk=prescription_id)
         lock_planning()
         event = locked_event(outbox_id, prescription_id, 'PLANNING')
         if event and event.processed_at:
@@ -114,7 +114,7 @@ def calculate_automatic_calendar_task(tenant_schema_name, prescription_id, outbo
         event = locked_event(outbox_id, prescription_id, 'CALENDAR')
         if event and event.processed_at:
             return {'status': 'already_processed'}
-        order = Prescription.objects.select_for_update().get(pk=prescription_id)
+        order = Prescription.objects.select_for_update(no_key=True).get(pk=prescription_id)
         from zoneinfo import ZoneInfo
         days = {'STANDARD': 4, 'EXPRESS': 2, 'NEXT_DAY': 1}[order.delivery_service]
         if order.is_fast_track and order.delivery_service == 'STANDARD':
@@ -138,7 +138,7 @@ def generate_invoice_pdf_task(tenant_schema_name, prescription_id, outbox_id=Non
     tenant = active_tenant(tenant_schema_name)
     with tenant_context(tenant), transaction.atomic():
         event = locked_event(outbox_id, prescription_id, 'INVOICE')
-        order = Prescription.objects.select_for_update().get(pk=prescription_id)
+        order = Prescription.objects.select_for_update(no_key=True).get(pk=prescription_id)
         if order.invoiced_at is None or order.invoiced_amount is None:
             raise ValueError('A confirmed invoice snapshot is required.')
         from .models import FinanceInvoice, InvoiceDocument

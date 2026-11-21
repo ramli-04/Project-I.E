@@ -2,6 +2,7 @@
 import hashlib
 import json
 import uuid
+from copy import copy
 from datetime import timedelta
 from decimal import Decimal
 
@@ -85,7 +86,8 @@ def execute_case_command(order_id, command, data, actor, role, idempotency_key):
             clinic_id = Prescription.objects.values_list('partner_clinic_id', flat=True).get(pk=order_id)
             if clinic_id:
                 billing_lock(clinic_id)
-        order = Prescription.objects.select_for_update().get(pk=order_id)
+        # Serialize source writers while allowing planning's deferred FK checks.
+        order = Prescription.objects.select_for_update(no_key=True).get(pk=order_id)
         prior = CaseCommandReceipt.objects.filter(pk=key).first()
         if prior:
             if prior.prescription_id != order.pk or prior.command != command or prior.payload_digest != digest:
@@ -113,17 +115,25 @@ def _execute(order, command, data, actor, role, metadata):
     if command == 'advance':
         allowed(role, {'RECEPTION','CAO','FAO','QUALITE'})
         from .planning import EXTERNAL
-        if 'status' in data or order.status in EXTERNAL or next_status(order) == 'VALIDATION_CAO':
+        if 'status' in data or order.status in EXTERNAL:
             raise ValidationError('Utilisez la commande métier spécialisée pour cette étape ; aucun statut arbitraire n’est accepté.')
-        target = next_status(order)
-        if not target:
-            raise ValidationError('Aucune étape suivante disponible.')
         from .case_serializers import PrescriptionSerializer
         serializer = PrescriptionSerializer(order, data={**{k:v for k,v in data.items() if k != 'notes'},
-            'action_notes':str(data.get('notes','')), 'status':target}, partial=True,
+            'action_notes':str(data.get('notes',''))}, partial=True,
             context={'command_role':role,'command_actor':actor,'command_action':'ADVANCE'})
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        # Compute the destination from the validated proposed route, without mutating
+        # the persisted source before its normal domain and audit guards run.
+        proposed = copy(order)
+        for field in ('production_method', 'thermal_treatment'):
+            if field in serializer.validated_data:
+                setattr(proposed, field, serializer.validated_data[field])
+        target = next_status(proposed)
+        if target == 'VALIDATION_CAO':
+            raise ValidationError('Utilisez la commande métier spécialisée pour cette étape ; aucun statut arbitraire n’est accepté.')
+        if not target:
+            raise ValidationError('Aucune étape suivante disponible.')
+        serializer.save(status=target)
         return {'status':order.status}
     if isinstance(command, str) and command.startswith('planning-'):
         from .planning import task_command

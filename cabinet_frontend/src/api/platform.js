@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { previewAdapter, previewMode } from './preview';
+import { installFeedback } from '../notifications';
 
 const origin = new URL(import.meta.env.VITE_API_ORIGIN || 'http://localhost:8000');
 const platform = axios.create({ baseURL: new URL('/platform/', origin).toString(), ...(previewMode ? { adapter: previewAdapter } : {}) });
@@ -9,6 +10,7 @@ platform.interceptors.request.use(config => {
   return config;
 });
 export default platform;
+installFeedback(platform);
 platform.interceptors.response.use(response => response, error => {
   if (error.response?.status === 401 && error.config?.url !== 'login/') {
     sessionStorage.removeItem('demo_token'); sessionStorage.removeItem('demo_user');

@@ -6,6 +6,7 @@ import sys
 import os
 import secrets
 from celery.schedules import crontab
+from corsheaders.defaults import default_headers
 
 try:
     from .local_settings import POSTGRES_PASSWORD as _local_postgres_password
@@ -80,8 +81,9 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-# ---------- CORS (dev only — allow everything) ----------
+# ---------- CORS ----------
 CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_HEADERS = [*default_headers, 'idempotency-key']
 CORS_ALLOWED_ORIGINS = [value for value in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if value]
 CORS_ALLOWED_ORIGIN_REGEXES = [r'^http://([a-z0-9-]+\.)?localhost:(5173|4173|8000)$']
 CORS_ALLOW_METHODS = [
@@ -143,7 +145,7 @@ USE_TZ = True
 
 # ---------- STATIC FILES ----------
 STATIC_URL = "/static/"
-STATICFILES_DIRS = [BASE_DIR / "frontend_build"]   # Frontend assets served here
+STATICFILES_DIRS = [path for path in [BASE_DIR / "frontend_build"] if path.is_dir()]
 
 # ---------- DRF ----------
 REST_FRAMEWORK = {

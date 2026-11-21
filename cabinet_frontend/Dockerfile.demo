@@ -3,7 +3,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-ENV VITE_API_ORIGIN=http://localhost:18000 \
+ARG API_ORIGIN=http://localhost:18000
+ENV VITE_API_ORIGIN=${API_ORIGIN} \
     VITE_SIMULATION=1
 RUN npm run build
 

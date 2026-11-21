@@ -68,6 +68,7 @@ def validate_source_change(order, previous, fields):
     action = metadata.get('action', 'TRANSITION')
     if role not in {'MANAGER', 'SYSTEM'}:
         special = ((role == 'DENTIST' and action in {'DESIGN_DECISION', 'FITTING', 'RESUBMIT'})
+                   or (role == 'DENTIST' and action == 'CONFIRM_DELIVERY' and old == 'EN_ROUTE_CABINET' and order.status == 'LIVRE')
                    or (action == 'REWORK' and role in {'RECEPTION', 'CAO', 'FAO', 'QUALITE', 'DENTIST'}))
         if not special and old not in ROLE_STAGES.get(role, set()):
             raise ValidationError('Your workstation cannot perform this transition.')

@@ -53,7 +53,7 @@ def close_period(period_id, actor):
             raise ValidationError('No uncontested, included cases remain to invoice.')
         snapshots = []
         for line in included:
-            source = Prescription.objects.select_for_update().get(pk=line.prescription_id)
+            source = Prescription.objects.select_for_update(no_key=True).get(pk=line.prescription_id)
             if source.invoiced_at or source.total_price is None:
                 raise ValidationError('A statement case is already invoiced or still awaits a quote.')
             snapshots.append({**line.snapshot, 'case_id': str(source.pk), 'base_amount': str(line.base_amount),
@@ -67,7 +67,7 @@ def close_period(period_id, actor):
             express_surcharge=extra, total_amount=base + extra, issued_by=actor)
         with prescription_audit_context(actor, 'Monthly closing', {'role': 'COMPTABILITE', 'action': 'ISSUE_INVOICE'}):
             for line in included:
-                source = Prescription.objects.select_for_update().get(pk=line.prescription_id)
+                source = Prescription.objects.select_for_update(no_key=True).get(pk=line.prescription_id)
                 source.billing_stage = 'FACTURE'
                 source.save(update_fields=['billing_stage', 'updated_at'])
                 WorkflowEvent.objects.create(prescription=source, kind='INVOICE_ISSUED', changed_by=actor,
@@ -82,7 +82,7 @@ def adjust_statement_line(line_id, *, contested, excluded, reason, actor):
     initial = StatementLine.objects.select_related('period').get(pk=line_id)
     with transaction.atomic():
         billing_lock(initial.period.clinic_id)
-        line = StatementLine.objects.select_for_update().select_related('period', 'prescription').get(pk=line_id)
+        line = StatementLine.objects.select_for_update(of=('self',)).select_related('period', 'prescription').get(pk=line_id)
         if line.period.closed_at:
             raise ValidationError('Issued statements require a credit note, not a line edit.')
         if type(contested) is not bool or type(excluded) is not bool or not reason.strip():
