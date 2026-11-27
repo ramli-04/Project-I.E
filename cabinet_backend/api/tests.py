@@ -1,7 +1,7 @@
 from django_tenants.test.cases import TenantTestCase
 from rest_framework.test import APIClient
 from datetime import date, timedelta
-from .alerts import laboratory_alerts
+from .alerts import _qty, laboratory_alerts
 from .models import StockItem, StaffMember, Equipment
 import uuid
 from django_tenants.utils import schema_context
@@ -196,3 +196,17 @@ class ConfigurationTests(WorkflowFixtures, TenantTestCase):
         order.refresh_from_db()
         self.assertEqual(order.status, 'DEMANDE_RECUE')
         self.assertEqual(order.audit_history.count(), 1)
+
+
+
+from django.test import SimpleTestCase  # noqa: E402
+
+
+class AlertQuantityFormatTests(SimpleTestCase):
+    def test_alert_quantities_drop_trailing_zeros_without_scientific_notation(self):
+        from decimal import Decimal
+        self.assertEqual(_qty(Decimal('4.000000')), '4')
+        self.assertEqual(_qty(Decimal('350.000000')), '350')
+        self.assertEqual(_qty(Decimal('350.500000')), '350.5')
+        self.assertEqual(_qty(Decimal('0.000000')), '0')
+        self.assertEqual(_qty(2.5), '2.5')

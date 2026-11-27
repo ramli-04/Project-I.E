@@ -96,7 +96,7 @@ test('manager loads real cases and planning/workload/resource screens', async ({
   await login(page);
   await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
   await page.getByLabel('Rechercher dans la gestion des commandes').fill('DEMO-PRINT-STANDARD');
-  await expect(page.getByRole('button', { name: 'Ouvrir le diagramme DEMO-PRINT-STANDARD' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Ouvrir le dossier DEMO-PRINT-STANDARD' })).toBeVisible();
   await page.getByRole('button', { name: 'Planning', exact: true }).click();
   await expect(page.getByLabel('Date du planning')).toBeVisible();
   await page.getByRole('button', { name: 'Charge', exact: true }).click();
@@ -107,7 +107,33 @@ test('manager loads real cases and planning/workload/resource screens', async ({
   expect(problems).toEqual([]);
 });
 
-async function preparePlanningCase(request, track = 'NUMERIQUE') {
+test('real work queue lands on personal work and shares planning assignment flags', async ({ page, request }, info) => {
+  const problems = observe(page);
+  await login(page);
+  await expect(page.getByRole('heading', { name: 'À faire', exact: true })).toBeVisible();
+  await expect(page.getByLabel('Rechercher dans ma file')).toBeVisible();
+  const token = await authenticate(request, 'Demo Fabrication', 'LAB');
+  const headers = { Host: tenantHost, Authorization: `Bearer ${token}` };
+  const response = await request.get(backend + '/api/work-queue/?page_size=200', { headers });
+  expect(response.status()).toBe(200);
+  const rows = (await response.json()).results;
+  for (const row of rows) {
+    expect(['TODO', 'WAITING', 'PAUSED', 'TEAM']).toContain(row.group);
+    expect(row.status).not.toBe('CLOTURE');
+    expect(row).not.toHaveProperty('delivery_pin_hash');
+    if (row.task) {
+      const task = await request.get(backend + `/api/planning/tasks/${row.task.id}/`, { headers });
+      expect(task.status()).toBe(200);
+      expect((await task.json()).can_operate).toBe(row.task.can_operate);
+    }
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  await page.screenshot({ path: info.outputPath('real-work-queue-390.png'), fullPage: true });
+  expect(problems).toEqual([]);
+});
+
+async function preparePlanningCase(request, track = 'NUMERIQUE', unaccepted = false) {
   const manager = await authenticate(request, 'Demo Manager', 'LAB');
   const dentist = await authenticate(request, 'Demo Dentist', 'DENTIST');
   const headers = { Host: tenantHost, Authorization: `Bearer ${manager}` };
@@ -134,6 +160,7 @@ async function preparePlanningCase(request, track = 'NUMERIQUE') {
     expect(response.status(), `${action}: ${await response.text()}`).toBe(200);
     return response.json();
   };
+  if (unaccepted) return { reference, order, url, headers, command, dentist };
   expect((await request.patch(url, { headers, data: { accepted: true } })).status()).toBe(200);
   await command('quote', { surcharge: '100.00', notes: 'Synthetic browser test manual J+1 quote' });
   await command('advance');
@@ -173,6 +200,52 @@ function syntheticQrToken(id) {
     cwd: new URL('../..', import.meta.url), encoding: 'utf8', windowsHide: true,
   }).trim();
 }
+
+async function openLiveCase(page, reference) {
+  await login(page);
+  await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
+  await page.getByLabel('Rechercher dans la gestion des commandes').fill(reference);
+  await page.getByRole('button', { name: `Ouvrir le dossier ${reference}`, exact: true }).click();
+  return page.getByRole('dialog', { name: `Dossier clinique — ${reference}`, exact: true });
+}
+
+test('real courier screen uses the restricted server status label', async ({ page, request }, info) => {
+  const problems = observe(page);
+  const { reference, url, command } = await preparePlanningCase(request, 'PHYSIQUE', true);
+  await command('accept'); await command('advance', { analysis_validated: true });
+  const token = await authenticate(request, 'Demo Courier', 'COURIER');
+  const response = await request.get(url, { headers: { Host: tenantHost, Authorization: `Bearer ${token}` } });
+  expect(response.status()).toBe(200);
+  const data = await response.json();
+  expect(data.status_label).toBeTruthy(); expect(data).not.toHaveProperty('clinical_items');
+  await login(page, 'Demo Courier', 'COURIER');
+  const card = page.locator('section').filter({ has: page.getByRole('heading', { name: reference, exact: true }) });
+  await expect(card.getByText(data.status_label, { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Confirmer la collecte', exact: true })).toBeVisible();
+  await page.screenshot({ path: info.outputPath('real-courier-server-label.png'), fullPage: true });
+  expect(problems).toEqual([]);
+});
+
+test('real UI accepts and confirms analysis with one command per explicit click', async ({ page, request }, info) => {
+  const problems = observe(page);
+  const { reference, order, url, headers } = await preparePlanningCase(request, 'NUMERIQUE', true);
+  const commands = [];
+  page.on('request', req => { if (req.method() === 'POST' && req.url().endsWith(`/prescriptions/${order.id}/command/`)) commands.push(req); });
+  const dialog = await openLiveCase(page, reference);
+  await dialog.getByRole('button', { name: 'Accepter et analyser', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: /^Analyse validée/ })).toBeVisible();
+  let state = await (await request.get(url, { headers })).json();
+  expect(state.status).toBe('ANALYSE_DEMANDE'); expect(state.accepted).toBe(true);
+  expect(state.accepted_at).toBeTruthy(); expect(state.analysis_validated).toBe(false);
+  await dialog.getByRole('button', { name: /^Analyse validée/ }).click();
+  await expect(dialog.getByRole('button', { name: /^Réception confirmée/ })).toBeVisible();
+  state = await (await request.get(url, { headers })).json();
+  expect(state.status).toBe('A_CONFIRMER'); expect(state.analysis_validated).toBe(true);
+  expect(commands.map(req => req.postDataJSON().action)).toEqual(['accept', 'advance']);
+  for (const req of commands) expect(req.headers()['idempotency-key']).toMatch(/^[0-9a-f-]{36}$/);
+  await page.screenshot({ path: info.outputPath('real-one-click-confirmations.png'), fullPage: true });
+  expect(problems).toEqual([]);
+});
 
 test('planning route selection and advancement work in one request', async ({ request }) => {
   const { url, headers } = await preparePlanningCase(request);
@@ -224,15 +297,16 @@ test('human starts, pauses, resumes and completes a real CAO task', async ({ pag
   await login(page);
   await page.getByRole('button', { name: 'Commandes', exact: true }).first().click();
   await page.getByLabel('Rechercher dans la gestion des commandes').fill(reference);
-  await page.getByRole('button', { name: `Ouvrir le diagramme ${reference}` }).click();
-  await page.getByRole('tab', { name: 'Progression et machines' }).click();
+  await page.getByRole('button', { name: `Ouvrir le dossier ${reference}` }).click();
   const current = page.locator('.planning-step').filter({ has: page.locator('strong', { hasText: 'Conception numérique / CAO' }) });
   await expect(current).toBeVisible();
   await page.getByRole('textbox', { name: 'Commentaire de progression / motif du blocage', exact: true }).fill('Supervisor starts ready CAD work; movable forecasts may be recalculated');
+  await current.getByLabel('Démarrage supervisé par le responsable').check();
   await current.getByRole('button', { name: 'Démarrer maintenant et replanifier', exact: true }).click();
   await expect.poll(taskState).toBe('IN_PROGRESS');
   await page.getByRole('textbox', { name: 'Commentaire de progression / motif du blocage', exact: true }).fill('Synthetic operator pause for browser verification');
-  await current.getByRole('button', { name: 'Mettre en pause', exact: true }).click();
+  await page.getByRole('dialog').locator('summary').filter({ hasText: /^Signaler un problème$/ }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Mettre en pause', exact: true }).click();
   await expect.poll(taskState).toBe('PAUSED');
   await current.getByRole('button', { name: 'Reprendre', exact: true }).click();
   await expect.poll(taskState).toBe('IN_PROGRESS');
@@ -284,11 +358,12 @@ test('equipment phases release technician and require explicit unloading through
   await login(page);
   await page.getByRole('button',{name:'Commandes',exact:true}).first().click();
   await page.getByLabel('Rechercher dans la gestion des commandes').fill(reference);
-  await page.getByRole('button',{name:`Ouvrir le diagramme ${reference}`}).click();
-  await page.getByRole('tab', { name: 'Progression et machines' }).click();
+  await page.getByRole('button',{name:`Ouvrir le dossier ${reference}`}).click();
   const current=page.locator('.planning-step').filter({has:page.locator('strong',{hasText:task.title})});
   await expect(current).toBeVisible();
   await page.getByRole('textbox', { name: 'Commentaire de progression / motif du blocage', exact: true }).fill('Synthetic operator verifies actual machine phase for browser acceptance');
+  const supervision = current.getByLabel('Démarrage supervisé par le responsable');
+  if (await supervision.isVisible()) await supervision.check();
   const early=current.getByRole('button',{name:'Démarrer maintenant et replanifier',exact:true});
   if(await early.isVisible())await early.click();
   else await current.getByRole('button',{name:'Démarrer',exact:true}).click();
@@ -313,6 +388,7 @@ test('equipment phases release technician and require explicit unloading through
 
 for (const [track, route] of [['PHYSIQUE', 'CFAO'], ['NUMERIQUE', 'IMPRESSION_3D']]) {
   test(`${track}: real workflow reaches delivery, fitting and monthly statement`, async ({ page, request }, info) => {
+    const problems = observe(page);
     const { reference, order, url, headers, command, dentist } = await preparePlanningCase(request, track);
     await command('advance', { production_method: route,
       delivery_date: new Date(Date.now() + 86400000).toISOString().slice(0, 10) });
@@ -326,11 +402,18 @@ for (const [track, route] of [['PHYSIQUE', 'CFAO'], ['NUMERIQUE', 'IMPRESSION_3D
       state = await (await request.get(url, { headers })).json();
     }
     expect(state.status).toBe('CONTROLE_QUALITE');
-    await command('inspection', { stage: 'QUALITY', checks: {
-      margins: true, contacts: true, shade: true, occlusion: true,
-      cosmetic: true, glazing: true, polishing: true,
-    } });
-    await command('advance');
+    const dialog = await openLiveCase(page, reference);
+    await dialog.getByRole('button', { name: 'Tout conforme', exact: true }).click();
+    await expect.poll(async () => (await (await request.get(url, { headers })).json()).status).toBe('CONTROLE_QUALITE');
+    await dialog.getByRole('button', { name: /^Valider le contrôle →/ }).click();
+    await expect.poll(async () => (await (await request.get(url, { headers })).json()).status).toBe('CONDITIONNEMENT');
+    await expect(dialog.getByRole('button', { name: /^Valider le contrôle →/ })).toHaveCount(0);
+    await expect(dialog.getByRole('region', { name: 'Votre action' })).toContainText('Conditionnement');
+    state = await (await request.get(url, { headers })).json();
+    expect(state.status).toBe('CONDITIONNEMENT'); expect(state.quality_validated).toBe(true);
+    const evidence = await (await request.get(url + 'evidence/', { headers })).json();
+    expect(evidence.inspections.filter(row => row.stage === 'QUALITY')).toHaveLength(1);
+    await page.keyboard.press('Escape');
     const slip = await request.get(url + 'delivery-slip/', { headers });
     expect(slip.status()).toBe(200);
     expect((await slip.body()).subarray(0, 5).toString()).toBe('%PDF-');
@@ -356,7 +439,6 @@ for (const [track, route] of [['PHYSIQUE', 'CFAO'], ['NUMERIQUE', 'IMPRESSION_3D
     const matching = (await statements.json()).results.filter(row => row.prescription === order.id);
     expect(matching, 'Delivered case enters the monthly statement exactly once').toHaveLength(1);
     const [line] = matching;
-    const problems = observe(page);
     await login(page);
     await page.locator('button.sidebar-link[aria-label="Facturation"]').click();
     await expect(page.getByRole('heading', { name: 'Situations mensuelles et facturation' })).toBeVisible();
@@ -389,4 +471,156 @@ test('mobile login and manager navigation stay usable', async ({ page }, info) =
   await page.getByRole('button', { name: 'Planning', exact: true }).click();
   await expect(page.getByLabel('Date du planning')).toBeVisible();
   await page.screenshot({ path: info.outputPath('real-mobile.png'), fullPage: true });
+});
+
+
+test('real dentist form previews provisional capacity and creates without choosing fabrication', async ({ page }) => {
+  const problems = observe(page);
+  await login(page, 'Demo Dentist', 'DENTIST');
+  await page.getByRole('button', { name: 'Nouvelle prescription', exact: true }).click();
+  await page.getByLabel('Laboratoire destinataire').selectOption('simlab');
+  const clinic = page.getByLabel('Cabinet et adresse de collecte');
+  await expect.poll(() => clinic.locator('option').count()).toBeGreaterThan(1);
+  await clinic.selectOption(await clinic.locator('option').nth(1).getAttribute('value'));
+  await page.getByLabel('Référence patient anonyme').fill('BROWSER-CAP-'+randomUUID().slice(0, 8));
+  await page.getByRole('button', { name: 'Dent 11', exact: true }).click();
+  const tooth11 = page.getByRole('group', { name: 'Dent 11' });
+  await tooth11.getByLabel('Fonction', { exact: true }).selectOption('Couronne');
+  await tooth11.getByLabel('Forme', { exact: true }).selectOption('Anatomique');
+  await tooth11.getByLabel('Teinte', { exact: true }).selectOption('A1');
+  await tooth11.getByLabel('Matériau', { exact: true }).selectOption('Zircone');
+  const preview = page.waitForResponse(response => response.url().endsWith('/platform/dentist/capacity-preview/')
+    && response.request().postDataJSON()?.clinical_item_count === 2);
+  await page.getByRole('button', { name: 'Dent 21', exact: true }).click();
+  const tooth21 = page.getByRole('group', { name: 'Dent 21' });
+  await tooth21.getByLabel('Fonction', { exact: true }).selectOption('Couronne');
+  await tooth21.getByLabel('Forme', { exact: true }).selectOption('Anatomique');
+  await tooth21.getByLabel('Teinte', { exact: true }).selectOption('A1');
+  await tooth21.getByLabel('Matériau', { exact: true }).selectOption('Zircone');
+  const response = await preview;
+  expect(response.status()).toBe(200);
+  const estimate = await response.json();
+  expect(estimate.provisional).toBe(true);
+  expect(estimate).toHaveProperty('requested_deadline');
+  expect(estimate).not.toHaveProperty('employee');
+  expect(estimate).not.toHaveProperty('cases');
+  await page.getByLabel('Je confirme la désinfection').check();
+  const creation = page.waitForResponse(response => response.url().endsWith('/platform/dentist/orders/') && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Envoyer la prescription', exact: true }).click();
+  const created = await creation;
+  expect(created.status()).toBe(201);
+  expect((await created.json()).production_method).toBe('');
+  await expect(page.getByText('Prescription enregistrée', { exact: true })).toBeVisible();
+  expect(problems).toEqual([]);
+});
+
+
+test('verification-only new invoice accepts a real partial cheque and immutable reversal', async ({ page, request }, info) => {
+  expect(composeProject, 'Historical payment fixtures are restricted to verification').toBe('cabinet-ui-verification');
+  const output = execFileSync('docker', ['compose', '-p', composeProject, '-f', 'compose.demo.yml', '-f', 'compose.verify.yml',
+    'exec', '-T', 'backend', 'python', 'api/testdata/payment_live_fixture.py'], { cwd: '..', encoding: 'utf8', timeout: 60000 });
+  const fixture = JSON.parse(output.trim());
+  const problems = observe(page);
+  await login(page);
+  await page.locator('button.sidebar-link[aria-label="Facturation"]').click();
+  await page.getByRole('button', { name: 'Enregistrer un encaissement', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Enregistrer un encaissement', exact: true });
+  await dialog.getByLabel('Cabinet payeur').selectOption(String(fixture.clinic));
+  await dialog.getByLabel('Montant encaissé (MAD)', { exact: true }).fill('400');
+  await dialog.getByLabel('Référence du paiement', { exact: true }).fill(fixture.reference);
+  await dialog.getByLabel('Banque', { exact: true }).fill('Banque synthétique');
+  await expect(dialog.getByLabel(`Affectation à ${fixture.number} (MAD)`)).toHaveValue('400.00');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: info.outputPath('payment-real-390.png'), fullPage: true });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  const recorded = page.waitForResponse(response => response.url().endsWith('/api/billing/payments/') && response.request().method() === 'POST');
+  await dialog.getByRole('button', { name: 'Enregistrer le paiement', exact: true }).click();
+  const response = await recorded;
+  expect(response.status()).toBe(201);
+  const payment = await response.json();
+  await expect(dialog).toHaveCount(0);
+  const manager = await authenticate(request, 'Demo Manager', 'LAB');
+  const headers = { Host: tenantHost, Authorization: `Bearer ${manager}` };
+  let invoice = await (await request.get(`${backend}/api/billing/invoices/${fixture.invoice}/`, { headers })).json();
+  expect(invoice.payment_status).toBe('PARTIELLE'); expect(invoice.balance).toBe('800.00');
+  const history = page.getByText(fixture.reference, { exact: false }).filter({ hasText: 'Réf.' }).locator('..');
+  await history.getByRole('button', { name: 'Marquer comme impayé / Annuler la saisie', exact: true }).click();
+  const reverse = page.getByRole('dialog', { name: 'Annuler ou signaler un impayé', exact: true });
+  await reverse.getByLabel('Motif de l’annulation').selectOption('IMPAYE');
+  await reverse.getByRole('button', { name: 'Confirmer l’annulation du paiement', exact: true }).click();
+  await expect(reverse).toHaveCount(0);
+  invoice = await (await request.get(`${backend}/api/billing/invoices/${fixture.invoice}/`, { headers })).json();
+  expect(invoice.balance).toBe('1200.00'); expect(invoice.payment_status).toBe('IMPAYEE');
+  const evidence = await request.get(`${backend}/api/billing/payments/${payment.id}/`, { headers });
+  expect((await evidence.json()).reversal.reason).toBe('IMPAYE');
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await login(page, 'Demo Dentist', 'DENTIST');
+  await page.getByRole('button', { name: /Mes commandes/ }).click();
+  await page.getByLabel('Rechercher mes commandes').fill(fixture.reference);
+  await page.getByRole('button', { name: `Ouvrir le dossier ${fixture.reference}`, exact: true }).click();
+  const dossier = page.getByRole('dialog', { name: /Dossier clinique/ });
+  await dossier.locator('summary').filter({ hasText: /^Dossier$/ }).click();
+  await dossier.getByRole('button', { name: 'Consulter le solde', exact: true }).click();
+  await expect(dossier.getByText('Impayée', { exact: true })).toBeVisible();
+  await expect(dossier).toContainText('1\u202f200,00 MAD');
+  expect(problems).toEqual([]);
+});
+
+test('real manager dashboard shows tenant summary and opens a case at mobile width', async ({ page, request }) => {
+  const errors = observe(page);
+  await login(page);
+  const manager = await authenticate(request, 'Demo Manager', 'LAB');
+  const response = await request.get(backend + '/api/dashboard/summary/', { headers: { Host: tenantHost, Authorization: `Bearer ${manager}` } });
+  expect(response.status()).toBe(200); expect(response.headers()['cache-control']).toBe('no-store');
+  const summary = await response.json(); expect(summary.operations.active_cases).toBeGreaterThan(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: 'Ouvrir la navigation', exact: true }).click();
+  await page.getByRole('button', { name: 'Tableau de bord', exact: true }).click();
+  const region = page.getByRole('region', { name: 'Indicateurs du laboratoire' });
+  await expect(region.getByText('Dossiers actifs', { exact: true }).locator('..')).toContainText(String(summary.operations.active_cases));
+  await expect(region.getByRole('heading', { name: 'Finances', exact: true })).toBeVisible();
+  const open = region.getByRole('button', { name: /^Ouvrir le dossier / }).first();
+  await open.focus(); await page.keyboard.press('Enter'); await expect(page.getByRole('dialog', { name: /Dossier clinique/ })).toBeVisible();
+  await page.keyboard.press('Escape'); await expect(open).toBeFocused();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  expect(errors).toEqual([]);
+});
+
+
+test('real laboratory identity saves at390px and rejects technical-role edits', async ({ page, request }, info) => {
+  expect(composeProject, 'identity writes use the isolated verification project').toBe('cabinet-ui-verification');
+  const problems = observe(page);
+  await page.setViewportSize({ width:390, height:844 });
+  await login(page);
+  await page.getByRole('button', { name:'Ouvrir la navigation', exact:true }).click();
+  await page.getByRole('button', { name:'Configuration', exact:true }).click();
+  const summary = page.locator('summary').filter({ hasText:/^Identité du laboratoire$/ });
+  await summary.focus(); await page.keyboard.press('Enter');
+  const form = page.getByRole('form', { name:'Identité du laboratoire' });
+  await form.getByLabel('Dénomination légale', { exact:true }).fill('Laboratoire Démo Test - fictif');
+  await form.getByLabel('Adresse du laboratoire', { exact:true }).fill('Adresse synthétique de vérification');
+  await form.getByLabel('Ville du laboratoire', { exact:true }).fill('Ville fictive');
+  await form.getByLabel('Téléphone du laboratoire', { exact:true }).fill('0000000000');
+  await form.getByLabel('E-mail du laboratoire', { exact:true }).fill('verification@example.invalid');
+  await form.getByLabel('ICE (15 chiffres)', { exact:true }).fill('000000000000000');
+  const recorded = page.waitForResponse(response => response.url().endsWith('/api/laboratory-profile/') && response.request().method()==='PUT');
+  await form.getByRole('button', { name:'Enregistrer l’identité', exact:true }).click();
+  const response = await recorded; expect(response.status()).toBe(200);
+  const saved = await response.json();
+  expect(saved.legal_name).toBe('Laboratoire Démo Test - fictif');
+  expect(saved.ice).toBe('000000000000000');
+  expect(saved.updated_by).toContain('Demo Manager');
+  await expect(page.getByRole('status').filter({ hasText:'Identité du laboratoire enregistrée.' })).toBeVisible();
+  const deniedToken = await authenticate(request,'Demo Fabrication','LAB');
+  const deniedHeaders = { Host:tenantHost, Authorization:'Bearer '+deniedToken };
+  expect((await request.get(backend+'/api/laboratory-profile/', { headers:deniedHeaders })).status()).toBe(403);
+  expect((await request.put(backend+'/api/laboratory-profile/', { headers:deniedHeaders, data:{ legal_name:'Unauthorized change' } })).status()).toBe(403);
+  const token = await authenticate(request,'Demo Manager','LAB');
+  const after = await request.get(backend+'/api/laboratory-profile/', { headers:{ Host:tenantHost, Authorization:'Bearer '+token } });
+  expect(after.status()).toBe(200); expect(await after.json()).toEqual(saved);
+  await summary.click(); await summary.focus(); await page.keyboard.press('Enter');
+  await expect(form.getByLabel('Dénomination légale', { exact:true })).toHaveValue(saved.legal_name);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  await page.screenshot({ path:info.outputPath('real-laboratory-identity-390.png'), fullPage:true });
+  expect(problems).toEqual([]);
 });

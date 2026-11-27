@@ -1,10 +1,12 @@
 import { useRef, useState } from 'react';
 import api from './api/client';
 import { errorText, retryableRequest } from './api/contracts';
-import { labelFor } from './api/messages';
+import { caseStatusLabel } from './api/messages';
 import { notify } from './notifications';
 import ActionDialog from './ActionDialog';
 import { Button, control, Field, Paged, Panel } from './IntegrationUI';
+import FilePicker from './FilePicker';
+import { decodeQrFile } from './qrImage';
 
 export default function CourierPortal({ orders, refresh }) {
   return <div className="space-y-5"><h1 className="text-2xl font-semibold">Collectes et livraisons</h1>
@@ -16,7 +18,7 @@ export default function CourierPortal({ orders, refresh }) {
 function CourierCase({ order, refresh }) {
   const [open, setOpen] = useState(false);
   const [qr, setQr] = useState(''); const [pin, setPin] = useState(''); const [busy, setBusy] = useState(false);
-  const [confirmed, setConfirmed] = useState(null);
+  const [confirmed, setConfirmed] = useState(null); const [qrFile, setQrFile] = useState(null);
   const request = useRef(retryableRequest());
   const action = { ATTENTE_RAMASSAGE: 'pickup', EN_ROUTE_LABO: 'lab-deposit', PRET_EXPEDITION: 'checkout', EN_ROUTE_CABINET: 'confirm-delivery' }[order.status];
   const titles = { pickup: 'Confirmer la collecte', 'lab-deposit': 'Scanner à l’arrivée au laboratoire', checkout: 'Sortir du laboratoire', 'confirm-delivery': 'Confirmer la livraison' };
@@ -33,7 +35,7 @@ function CourierCase({ order, refresh }) {
     try {
       const response = await request.current(api, `prescriptions/${order.id}/command/`, { action, data: action === 'confirm-delivery' ? { pin } : { qr_token: qr.trim() } });
       setConfirmed({ source: order.status, order: response.data.case || order });
-      setQr(''); setPin(''); setOpen(false);
+      setQr(''); setPin(''); setQrFile(null); setOpen(false);
       notify(success[action]);
       try { await refresh(); } catch { notify('Remise enregistrée. Actualisez les commandes pour afficher le nouvel état.', 'error'); }
     } catch (error) { notify(errorText(error), 'error'); }
@@ -42,12 +44,17 @@ function CourierCase({ order, refresh }) {
   return <Panel title={order.patient_ref}>
     <p className="text-sm">{order.clinic_name} · {order.dentist_name}</p>
     <p className="text-sm text-slate-500">{order.pickup_address} · {order.contact_phone}</p>
-    <p className="text-sm text-teal-700">{labelFor(displayed.status)}</p>
+    <p className="text-sm text-teal-700">{caseStatusLabel(displayed)}</p>
     {canAct ? <Button onClick={() => setOpen(true)}>{titles[action]}</Button> : <p className="text-sm text-slate-500">Remise enregistrée. La liste des missions se met à jour automatiquement.</p>}
     <ActionDialog open={open} busy={busy} onClose={() => setOpen(false)} title={`${titles[action] || 'Remise'} — ${order.patient_ref}`}>
       <form onSubmit={submit} noValidate className="space-y-4"><fieldset disabled={busy} className="space-y-4">
         {action === 'confirm-delivery' ? <Field label="PIN réel de livraison (4 chiffres)"><input autoFocus className={control} inputMode="numeric" maxLength={4} value={pin} onChange={event => setPin(event.target.value.replace(/\D/g, ''))} /></Field>
-          : <Field label="Contenu du QR signé du dossier"><textarea autoFocus className={control} value={qr} onChange={event => setQr(event.target.value)} /></Field>}
+          : <><FilePicker label="Importer l’image du QR (photo ou étiquette)" accept="image/*" file={qrFile} onChange={async file => {
+              setQrFile(file); if (!file) return;
+              try { setQr(await decodeQrFile(file)); notify('QR lu depuis l’image. Vérifiez puis validez.'); }
+              catch (error) { notify(error.message || 'Lecture du QR impossible.', 'error'); }
+            }} />
+            <Field label="Contenu du QR signé du dossier"><textarea autoFocus className={control} value={qr} onChange={event => setQr(event.target.value)} /></Field></>}
         <p className="text-sm text-slate-500">{action === 'lab-deposit' ? 'Validez ce scan uniquement à l’arrivée au laboratoire : il enregistre le dépôt dans l’historique du dossier.' : 'Cette validation enregistre la remise dans l’historique du dossier.'}</p>
         <Button type="submit">{busy ? 'Validation…' : action === 'lab-deposit' ? 'Valider le QR d’arrivée' : titles[action]}</Button>
       </fieldset></form>

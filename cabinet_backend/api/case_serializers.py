@@ -10,6 +10,7 @@ from .permissions import actor_role
 from .pricing import price_items
 from .signals import prescription_audit_context
 from .workflow import LABELS, next_status, workflow_steps
+from .workflow_spec import describe_current_step, describe_rework_options, describe_stages
 
 
 def actor_identity(request):
@@ -41,6 +42,9 @@ class PrescriptionSerializer(serializers.ModelSerializer):
     next_status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
     quote_required = serializers.SerializerMethodField()
+    current_step = serializers.SerializerMethodField()
+    stages = serializers.SerializerMethodField()
+    rework_restart_options = serializers.SerializerMethodField()
 
     class Meta:
         model = Prescription
@@ -73,6 +77,15 @@ class PrescriptionSerializer(serializers.ModelSerializer):
 
     def get_quote_required(self, obj):
         return obj.total_price is None
+
+    def get_current_step(self, obj):
+        return describe_current_step(obj)
+
+    def get_stages(self, obj):
+        return describe_stages(obj)
+
+    def get_rework_restart_options(self, obj):
+        return describe_rework_options(obj)
 
     def _audit_actor(self):
         return self.context.get('command_actor') or actor_identity(self.context.get('request'))
@@ -164,10 +177,14 @@ class PrescriptionSerializer(serializers.ModelSerializer):
 
 
 class CourierPrescriptionSerializer(serializers.ModelSerializer):
+    status_label = serializers.SerializerMethodField()
     clinic_name = serializers.CharField(source='partner_clinic.name', default='')
     pickup_address = serializers.CharField(source='partner_clinic.pickup_address', default='')
     contact_phone = serializers.CharField(source='partner_clinic.contact_phone', default='')
 
     class Meta:
         model = Prescription
-        fields = ['id', 'patient_ref', 'dentist_name', 'status', 'delivery_date', 'clinic_name', 'pickup_address', 'contact_phone', 'created_at', 'updated_at']
+        fields = ['id', 'patient_ref', 'dentist_name', 'status', 'status_label', 'delivery_date', 'clinic_name', 'pickup_address', 'contact_phone', 'created_at', 'updated_at']
+
+    def get_status_label(self, obj):
+        return LABELS.get(obj.status, obj.status)

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^(DEMO|MY-TEST|MY-DEMO|BROWSER)-[A-Za-z0-9_-]{1,40}$')]
+    [ValidatePattern('^(DEMO|TEST|MY-TEST|MY-DEMO|BROWSER)-[A-Za-z0-9_-]{1,40}$')]
     [string]$Reference,
     [switch]$Copy
 )

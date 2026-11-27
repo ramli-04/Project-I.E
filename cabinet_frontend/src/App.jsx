@@ -6,14 +6,14 @@ import AdminPortal from "./AdminPortal";
 import SupportButton from "./SupportButton";
 import LabBusinessConfiguration from "./LabBusinessConfiguration";
 import LabAdminLayout from "./LabAdminLayout";
-import { LabOverview, OrderManagement } from "./LabWorkspace";
-import { AlertPopup } from './LabAlerts';
+import { OrderManagement } from "./LabWorkspace";
+import { AlertPopup, DashboardAlerts } from './LabAlerts';
 import { useLabAlerts } from './useLabAlerts';
 import { useTenant } from "./contexts/useTenant";
 import { 
-  User, FileText, Package,
+  User,
   ShieldCheck, LogOut,
-  Settings, LayoutDashboard, ChevronDown
+  LayoutDashboard, ChevronDown
 } from "lucide-react";
 import DentistPortal from './DentistPortal';
 import CourierPortal from './CourierPortal';
@@ -21,6 +21,8 @@ import FinanceDashboard from './FinanceDashboard';
 import InventoryWorkspace from './InventoryWorkspace';
 import OperationsDashboard from './OperationsDashboard';
 import PlanningWorkspace from './PlanningWorkspace';
+import WorkQueue from './WorkQueue';
+import Dashboard from './Dashboard';
 import { allRows, errorText, workstation } from './api/contracts';
 import { Feedback, Button } from './IntegrationUI';
 import SidebarLogo from './SidebarLogo';
@@ -39,8 +41,7 @@ function Application() {
   const [orderError, setOrderError] = useState('');
   const [loadingOrders, setLoadingOrders] = useState(false);
   const loadSequence = useRef(0);
-  const [labSection, setLabSection] = useState('main');
-  const [labTab, setLabTab] = useState('dashboard');
+  const [labSection, setLabSection] = useState('home');
   const [alertFocus, setAlertFocus] = useState(0);
   const [configTarget, setConfigTarget] = useState(null);
   const { tenant, clearTenant } = useTenant();
@@ -75,8 +76,8 @@ function Application() {
     const expired = () => {
       loadSequence.current += 1;
       sessionStorage.removeItem('demo_token'); sessionStorage.removeItem('demo_user');
-      setUser(null); setOrders([]); setOrderError(''); setLabSection('main');
-      setLabTab('dashboard'); setConfigTarget(null); clearTenant();
+      setUser(null); setOrders([]); setOrderError(''); setLabSection('home');
+      setConfigTarget(null); clearTenant();
     };
     window.addEventListener('cabinet-session-expired', expired);
     return () => window.removeEventListener('cabinet-session-expired', expired);
@@ -88,7 +89,7 @@ function Application() {
   if (!user) return <DemoLogin setUser={setUser} />;
 
   if (user.role === 'Laboratoire') return <LabAdminLayout
-    section={labSection}
+    section={labSection === 'home' ? workstation() === 'COMPTABILITE' ? 'billing' : 'queue' : labSection}
     laboratoryName={tenant?.name || tenant?.id}
     onNavigate={section => { if (section === 'configuration') setConfigTarget(null); setLabSection(section); }}
     accountMenu={<><SupportButton /><AccountMenu user={user} tenant={tenant} onLogout={() => {
@@ -96,15 +97,15 @@ function Application() {
       if (token) platform.post('logout/', {}, { headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
       sessionStorage.removeItem('demo_token');
       sessionStorage.removeItem('demo_user');
-      setUser(null); setOrders([]); setLabSection('main'); setLabTab('dashboard'); setConfigTarget(null); clearTenant();
+      setUser(null); setOrders([]); setLabSection('home'); setConfigTarget(null); clearTenant();
     }} /></>}
   >
     {orderFeedback}
-    <LabPortal key={tenant?.id} section={labSection} activeTab={labTab} setActiveTab={setLabTab} configTarget={configTarget} alertState={alertState} alertFocus={alertFocus} onAlertSelect={alert => {
+    <LabPortal key={tenant?.id} section={labSection} configTarget={configTarget} alertState={alertState} alertFocus={alertFocus} onAlertSelect={alert => {
       setConfigTarget({ section: alert.section, id: alert.resource_id, request: Date.now() });
-      setLabSection('configuration');
+      setLabSection(alert.section === 'inventory' ? 'inventory' : 'configuration');
     }} orders={orders} refresh={fetchOrders} />
-    <AlertPopup alerts={alertState.alerts} onOpen={() => { setLabSection('main'); setLabTab('dashboard'); setAlertFocus(value => value + 1); }} />
+    <AlertPopup alerts={alertState.alerts} onOpen={() => { setLabSection('home'); setAlertFocus(value => value + 1); }} />
   </LabAdminLayout>;
 
   return (
@@ -115,14 +116,6 @@ function Application() {
           <SidebarLogo />
         </div>
         
-        {user.role === 'Laboratoire' && <nav aria-label="Navigation du laboratoire" className="space-y-2">
-          {[
-            ['main', 'Menu principal', LayoutDashboard],
-            ['orders', 'Commandes', Package],
-            ['billing', 'Facturation', FileText],
-            ['configuration', 'Configuration', Settings],
-          ].map(([key, label, Icon]) => <button key={key} onClick={() => { if (key === 'configuration') setConfigTarget(null); setLabSection(key); }} aria-current={labSection === key ? 'page' : undefined} className={`flex w-full items-center gap-3 rounded-xl px-4 py-3 text-sm font-medium transition-colors ${labSection === key ? 'border border-sky-400/20 bg-teal-600/15 text-teal-700' : 'border border-transparent text-slate-500 hover:bg-white hover:text-slate-900'}`}><Icon className="h-5 w-5" />{label}</button>)}
-        </nav>}
         {user.role === 'Administrateur' && <nav aria-label="Navigation administration"><div className="flex items-center gap-3 rounded-xl border border-sky-400/20 bg-teal-600/15 px-4 py-3 text-sm font-medium text-teal-700"><LayoutDashboard className="h-5 w-5" />Administration</div></nav>}
       </div>
 
@@ -142,8 +135,7 @@ function Application() {
             sessionStorage.removeItem('demo_user');
             setUser(null);
             setOrders([]);
-            setLabSection('main');
-            setLabTab('dashboard');
+            setLabSection('home');
             setConfigTarget(null);
             clearTenant();
           }} />
@@ -153,15 +145,8 @@ function Application() {
         <main className="p-4 sm:p-8 max-w-7xl mx-auto">{user.role !== 'Administrateur' && orderFeedback}
           {user.role === "Administrateur" && <AdminPortal />}
           {user.role === "Cabinet Dentaire" && <DentistPortal user={user} orders={orders} refresh={fetchOrders} />}
-          {user.role === "Laboratoire" && <LabPortal section={labSection} activeTab={labTab} setActiveTab={setLabTab} configTarget={configTarget} alertState={alertState} alertFocus={alertFocus} onAlertSelect={alert => {
-            setConfigTarget({ section: alert.section, id: alert.resource_id, request: Date.now() });
-            setLabSection('configuration');
-          }} orders={orders} refresh={fetchOrders} />}
           {user.role === "Coursier" && <CourierPortal orders={orders} refresh={fetchOrders} />}
         </main>
-        {user.role === 'Laboratoire' && <AlertPopup alerts={alertState.alerts} onOpen={() => {
-          setLabSection('main'); setLabTab('dashboard'); setAlertFocus(value => value + 1);
-        }} />}
       </div>
     </div>
   );
@@ -209,14 +194,18 @@ function AccountMenu({ user, tenant, onLogout }) {
   </div>;
 }
 
-function LabPortal({ section, orders, refresh, activeTab, setActiveTab, configTarget, alertState, alertFocus, onAlertSelect }) {
-  const patchOrder = async (id, payload) => { await api.patch(`prescriptions/${id}/`, payload); await refresh(); };
+function LabPortal({ section, orders, refresh, configTarget, alertState, alertFocus, onAlertSelect }) {
   const role = workstation();
+  if (section === 'queue' || section === 'home') {
+    const landing = section === 'home' && role === 'COMPTABILITE' ? <FinanceDashboard /> : <WorkQueue refreshOrders={refresh} />;
+    return <>{alertState.alerts.length > 0 && <div className="mb-6"><DashboardAlerts {...alertState} focusRequest={alertFocus} onSelect={onAlertSelect} compact /></div>}{landing}</>;
+  }
+  if (section === 'dashboard') return ['MANAGER', 'COMPTABILITE'].includes(role) ? <Dashboard refreshOrders={refresh} /> : <p>Accès responsable ou comptabilité requis.</p>;
   if (section === 'configuration') return <LabBusinessConfiguration key={configTarget?.request || 'configuration'} target={configTarget} />;
-  if (section === 'inventory') return <InventoryWorkspace orders={orders} />;
+  if (section === 'inventory') return <InventoryWorkspace key={configTarget?.section === 'inventory' ? configTarget.request : 'inventory'} orders={orders} focus={configTarget?.section === 'inventory' ? configTarget : null} />;
   if (section === 'planning') return <PlanningWorkspace orders={orders} refreshOrders={refresh} />;
   if (section === 'operations') return role === 'MANAGER' ? <OperationsDashboard /> : <p>Accès responsable requis.</p>;
-  if (section === 'orders') return <OrderManagement orders={orders} patchOrder={patchOrder} refresh={refresh} />;
+  if (section === 'orders') return <OrderManagement orders={orders} refresh={refresh} />;
   if (section === 'billing') return ['MANAGER','COMPTABILITE'].includes(role) ? <FinanceDashboard /> : <p>Accès comptabilité requis.</p>;
-  return <LabOverview orders={orders} tab={activeTab} setTab={setActiveTab} alertState={alertState} alertFocus={alertFocus} onAlertSelect={onAlertSelect} />;
+  return role === 'COMPTABILITE' ? <FinanceDashboard /> : <WorkQueue refreshOrders={refresh} />;
 }

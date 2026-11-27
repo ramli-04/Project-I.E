@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptsQuantity, allRows, completed, money, quantityInput, quantityText, retryableRequest, rowsOf } from './contracts.js';
+import { acceptsQuantity, allRows, completed, money, quantityInput, quantityText, retryableRequest, rowsOf, sumAmounts } from './contracts.js';
 
 test('loads every page while preserving endpoint, query and abort signal', async () => {
   const calls = []; const signal = new AbortController().signal;
@@ -60,4 +60,32 @@ test('quantities display and accept at most two decimal places', () => {
   assert.equal(acceptsQuantity('12.345'), false);
   assert.equal(acceptsQuantity('1e-6'), false);
   assert.equal(acceptsQuantity('-1'), false);
+});
+
+
+test('a payment dialog may keep one request key even after body changes or ambiguous errors', async () => {
+  const calls = []; const fixed = '11111111-1111-4111-8111-111111111111';
+  const client = { post: async (path, body, config) => { calls.push(config.headers['Idempotency-Key']); if (calls.length === 1) throw new Error('Network Error'); return { data: {} }; } };
+  const send = retryableRequest({ idempotencyKey: fixed });
+  await assert.rejects(send(client, 'billing/payments/', { amount: '10' }));
+  await send(client, 'billing/payments/', { amount: '11' });
+  assert.deepEqual(calls, [fixed, fixed]);
+});
+
+
+test('money preserves decimal API cents at large boundaries and keeps manual quotes explicit', () => {
+  const compact = value => money(value).replace(/\s/g, '');
+  assert.equal(compact('99999999999999.99'),'99999999999999,99MAD');
+  assert.equal(compact('-99999999999999.99'),'-99999999999999,99MAD');
+  assert.equal(compact('0.005'),'0,01MAD');
+  assert.equal(compact('1.999'),'2,00MAD');
+  assert.equal(money(null),'Devis laboratoire requis');
+  assert.equal(money('invalid'),'Montant indisponible');
+});
+
+test('finance totals and credit remainders keep cents beyond the number precision limit', () => {
+  assert.equal(sumAmounts(['99999999999999.99','0.01']),'100000000000000.00');
+  assert.equal(sumAmounts(['99999999999999.99','-99999999999999.98']),'0.01');
+  assert.equal(sumAmounts(['1500.00','450.00','-100.00']),'1850.00');
+  assert.equal(sumAmounts([]),'0.00');
 });

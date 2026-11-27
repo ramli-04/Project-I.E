@@ -6,7 +6,7 @@ from django.core.exceptions import ValidationError
 from django.db import connection, transaction
 from django.db.models import Sum
 from django.utils import timezone
-
+from .workflow_spec import Action
 from .models import (BillingPeriod, StatementLine, FinanceInvoice, CreditNote, Prescription,
                      WorkflowEvent, BillingDispute)
 from .signals import prescription_audit_context
@@ -65,7 +65,7 @@ def close_period(period_id, actor):
             number=f'INV-{period.month:%Y%m}-{connection.schema_name}-{period.pk.hex[:12]}',
             clinic_name=period.clinic.name, lines=snapshots, base_amount=base,
             express_surcharge=extra, total_amount=base + extra, issued_by=actor)
-        with prescription_audit_context(actor, 'Monthly closing', {'role': 'COMPTABILITE', 'action': 'ISSUE_INVOICE'}):
+        with prescription_audit_context(actor, 'Monthly closing', {'role': 'COMPTABILITE', 'action': Action.ISSUE_INVOICE}):
             for line in included:
                 source = Prescription.objects.select_for_update(no_key=True).get(pk=line.prescription_id)
                 source.billing_stage = 'FACTURE'

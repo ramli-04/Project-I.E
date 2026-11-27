@@ -131,6 +131,32 @@ class PlatformTests(TenantTestCase):
         self.assertEqual(self.client.get('/platform/dentist/orders/').data, [])
         self.assertEqual(self.client.get('/api/prescriptions/').status_code, 403)
 
+    def test_dentist_receives_workflow_descriptors_without_other_cases_or_workstation_notes(self):
+        from api.models import Prescription
+        with schema_context(self.tenant.schema_name):
+            for owner in [self.dentist, self.other]:
+                Prescription.objects.create(patient_ref='DESCRIPTOR-' + str(owner.pk),
+                    dentist_name=owner.name, dentist_account=owner, tooth_number=11,
+                    shade='A1', material='E-Max', disinfected=True,
+                    impression_type='PHYSIQUE', production_method='CFAO',
+                    workstation_notes={'CAO': 'Internal CAD note', 'RECEPTION': 'Internal intake note'})
+        self.login('Dentiste 1')
+        response = self.client.get('/platform/dentist/orders/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data), 1)
+        row = response.data[0]
+        self.assertEqual(row['patient_ref'], 'DESCRIPTOR-' + str(self.dentist.pk))
+        self.assertEqual(row['current_step']['kind'], 'ACCEPT')
+        self.assertEqual(row['current_step']['next_key'], row['next_status'])
+        self.assertTrue(row['stages'])
+        self.assertEqual(row['rework_restart_options'], [])
+        self.assertEqual(row['workstation_notes'], {})
+        self.assertNotIn('Internal CAD note', str(response.data))
+        self.assertNotIn('can_operate', row['current_step'])
+        self.assertNotIn('delivery_pin', row)
+        self.assertNotIn('delivery_pin_hash', row)
+        self.assertNotIn('qr_nonce', row)
+
     def test_technical_support_and_overview(self):
         self.login('Dentiste 1')
         created = self.client.post('/platform/support/', {'subject': 'Test technique', 'message': 'Description du problème'}, format='json')

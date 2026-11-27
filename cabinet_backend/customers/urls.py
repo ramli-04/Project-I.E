@@ -11,6 +11,7 @@ urlpatterns = [
     path('overview/', views.overview), path('logs/', views.logs),
     path('support/', views.support), path('support/<int:ticket_id>/', views.support),
     path('dentist/orders/', views.dentist_orders),
+    path('dentist/capacity-preview/', views.dentist_capacity_preview),
     path('pricing/', views.pricing_catalog),
     path('dentists/', views.dentist_directory),
     path('dentist/clinics/', views.dentist_clinics),

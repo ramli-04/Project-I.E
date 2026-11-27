@@ -19,7 +19,9 @@ export function dismissNotification(id) {
 }
 export function installFeedback(client) {
   client.interceptors.response.use(response => {
-    if (['post', 'put', 'patch', 'delete'].includes(response.config?.method) && response.config?.feedback !== false)
+    // Signing in or out is not a recorded business action: no "Action enregistrée." toast.
+    const authentication = /(^|\/)(login|logout)\/?$/.test(String(response.config?.url || ''));
+    if (['post', 'put', 'patch', 'delete'].includes(response.config?.method) && response.config?.feedback !== false && !authentication)
       notify('Action enregistrée.');
     return response;
   }, error => {

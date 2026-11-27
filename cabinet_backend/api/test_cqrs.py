@@ -15,6 +15,7 @@ from .models import Prescription, PrescriptionHistory
 from .signals import prescription_audit_context
 from customers.models import PlatformAccount
 from .test_support import WorkflowFixtures
+from .workflow_spec import WORKFLOW_PAYLOAD_SHAPE
 
 
 @override_settings(OUTBOX_PUBLISH_ON_COMMIT=False, CACHES={
@@ -143,6 +144,72 @@ class PrescriptionCQRSTests(WorkflowFixtures, TenantTestCase):
             order.save(update_fields=['total_price'])
         self.assertEqual(self.client.get('/api/prescriptions/').data['results'][0]['total_price'], '900.00')
         self.assertEqual(order.audit_history.count(), 1)
+
+    def test_physical_cfao_case_serializes_additive_workflow_descriptors(self):
+        order = self.create_order(impression_type='PHYSIQUE', production_method='CFAO',
+                                  design_validation_requested=True, thermal_treatment='CRISTALLISATION')
+        row = self.client.get('/api/prescriptions/').data['results'][0]
+        self.assertEqual(row['current_step']['key'], 'DEMANDE_RECUE')
+        self.assertEqual(row['current_step']['kind'], 'ACCEPT')
+        self.assertEqual(row['current_step']['owner_roles'], ['RECEPTION'])
+        self.assertEqual(row['current_step']['next_key'], row['next_status'])
+        self.assertEqual(row['rework_restart_options'], [])
+        self.assertEqual([stage['key'] for stage in row['stages']], [
+            'COMMANDE', 'RECEPTION', 'CONTROLE_ENTREE', 'MODELE', 'CONCEPTION',
+            'FABRICATION', 'FINITION_QC', 'LIVRAISON', 'CLOTURE'])
+        route = {step['key']: step['label'] for stage in row['stages'] for step in stage['steps']}
+        self.assertEqual(route, {step['key']: step['label'] for step in row['workflow_steps']})
+        self.assertIn('VALIDATION_CAO', route)
+        self.assertEqual(route['TRAITEMENT_THERMIQUE'], 'Cristallisation')
+        self.assertEqual(row['status_label'], 'Demande reçue / acceptation')
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'DEMANDE_RECUE')
+        self.assertEqual(order.audit_history.count(), 1)
+
+    def test_digital_3d_case_omits_inapplicable_physical_and_cnc_steps(self):
+        self.create_order(impression_type='NUMERIQUE', production_method='IMPRESSION_3D')
+        row = self.client.get('/api/prescriptions/').data['results'][0]
+        self.assertNotIn('MODELE', [stage['key'] for stage in row['stages']])
+        route = {step['key'] for stage in row['stages'] for step in stage['steps']}
+        self.assertTrue({'PREPARATION_3D', 'IMPRESSION_3D', 'POST_POLYMERISATION'} <= route)
+        self.assertFalse({'ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO', 'COULEE_PLATRE',
+                          'USINAGE_CNC', 'TRAITEMENT_THERMIQUE', 'VALIDATION_CAO'} & route)
+        self.assertEqual(row['current_step']['next_label'], 'Analyse de la demande')
+
+    def test_cache_shape_mismatch_discards_old_rows_even_with_current_generation(self):
+        order = self.create_order()
+        first = self.client.get('/api/prescriptions/')
+        fresh = cache.get('active_orders')
+        self.assertEqual(fresh['shape'], WORKFLOW_PAYLOAD_SHAPE)
+        for shape in [None, 'obsolete-workflow-shape']:
+            with self.subTest(shape=shape):
+                stale = {'version': fresh['version'], 'rows': [{'id': 'stale-without-descriptors'}]}
+                if shape is not None:
+                    stale['shape'] = shape
+                cache.set('active_orders', stale)
+                with CaptureQueriesContext(connection) as queries:
+                    response = self.client.get('/api/prescriptions/')
+                self.assertEqual(response.status_code, 200, response.data)
+                self.assertEqual(response.data, first.data)
+                self.assertEqual(str(response.data['results'][0]['id']), str(order.pk))
+                self.assertTrue(any('FROM "api_prescription"' in query['sql'] for query in queries))
+                self.assertEqual(cache.get('active_orders')['shape'], WORKFLOW_PAYLOAD_SHAPE)
+
+    def test_cached_workflow_descriptors_are_shared_but_workstation_notes_are_filtered(self):
+        self.create_order(workstation_notes={'CAO': 'CAD-only note', 'RECEPTION': 'Reception-only note'})
+        manager_row = self.client.get('/api/prescriptions/').data['results'][0]
+        with schema_context('public'):
+            worker = PlatformAccount.objects.create(name='CQRS CAD', login_key='cqrs-cad',
+                role='LAB', laboratory=self.tenant, workstation_role='CAO')
+        self.client.force_authenticate(user=worker)
+        with CaptureQueriesContext(connection) as queries:
+            worker_row = self.client.get('/api/prescriptions/').data['results'][0]
+        self.assertFalse(any('FROM "api_prescription"' in query['sql'] for query in queries))
+        for field in ['current_step', 'stages', 'rework_restart_options']:
+            self.assertEqual(worker_row[field], manager_row[field])
+        self.assertEqual(worker_row['workstation_notes'], {'CAO': 'CAD-only note'})
+        self.assertNotIn('can_operate', worker_row['current_step'])
+        self.assertNotIn('assigned_employee', worker_row['current_step'])
 
     def test_history_and_prescriptions_are_protected_from_destructive_writes(self):
         order = self.create_order()

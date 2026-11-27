@@ -48,10 +48,45 @@ class PeriodSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class InvoiceListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        from .payments import invoice_balances
+        items = list(data.all() if hasattr(data, 'all') else data)
+        summaries = invoice_balances(items)
+        for invoice in items:
+            invoice._payment_summary = summaries[invoice.pk]
+        return super().to_representation(items)
+
+
 class InvoiceSerializer(serializers.ModelSerializer):
+    paid_amount = serializers.SerializerMethodField()
+    credited_amount = serializers.SerializerMethodField()
+    balance = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    due_date = serializers.SerializerMethodField()
+    days_overdue = serializers.SerializerMethodField()
+    clinic = serializers.SerializerMethodField()
+    terms_days = serializers.SerializerMethodField()
+
+    def _summary(self, obj):
+        if not hasattr(obj, '_payment_summary'):
+            from .payments import invoice_balances
+            obj._payment_summary = invoice_balances([obj])[obj.pk]
+        return obj._payment_summary
+
+    def get_paid_amount(self, obj): return format(self._summary(obj)['paid_amount'], '.2f')
+    def get_credited_amount(self, obj): return format(self._summary(obj)['credited_amount'], '.2f')
+    def get_balance(self, obj): return format(self._summary(obj)['balance'], '.2f')
+    def get_payment_status(self, obj): return self._summary(obj)['payment_status']
+    def get_due_date(self, obj): return self._summary(obj)['due_date'].isoformat()
+    def get_days_overdue(self, obj): return self._summary(obj)['days_overdue']
+    def get_clinic(self, obj): return self._summary(obj)['clinic']
+    def get_terms_days(self, obj): return self._summary(obj)['terms_days']
+
     class Meta:
         model = FinanceInvoice
         fields = '__all__'
+        list_serializer_class = InvoiceListSerializer
 
 
 class LineSerializer(serializers.ModelSerializer):

@@ -210,13 +210,8 @@ class TaskSerializer(serializers.ModelSerializer):
     def get_external(self,obj): return obj.workflow_step in EXTERNAL
     def get_can_start_now(self,obj): return actor_role(self.context['request']) == 'MANAGER'
     def get_can_operate(self,obj):
-        request=self.context['request']
-        role=actor_role(request)
-        if role=='MANAGER': return True
-        employee=obj.assigned_employee
-        if not employee or role != obj.required_role: return False
-        from customers.models import PlatformAccount
-        return employee.platform_account_id == request.user.pk if isinstance(request.user,PlatformAccount) else employee.user_id == request.user.pk
+        from .permissions import can_operate_task
+        return can_operate_task(obj, self.context['request'])
 
 
 def date_period(params):

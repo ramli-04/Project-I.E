@@ -247,6 +247,28 @@ class PlanningTests(TenantTestCase):
         EmployeeAvailability.objects.create(employee=employee,availability_type='ABSENCE',starts_at=NOW,ends_at=NOW+timedelta(hours=3))
         with self.assertRaises(ValidationError): self.command(order,'planning-assign',{'task':str(task.pk),'employee':employee.pk,'start':NOW.isoformat(),'end':(NOW+timedelta(hours=1)).isoformat()})
 
+    def test_estimate_and_reschedule_commands_keep_existing_assignment_and_event_spellings(self):
+        employee = self.employee()
+        order = self.cao_case()
+        recalculate(now=NOW)
+        task = self.task(order)
+        for index, command in enumerate(('planning-estimate', 'planning-reschedule'), 1):
+            with self.subTest(command=command):
+                start = NOW + timedelta(hours=index)
+                duration = 35 + index
+                payload = {'task': str(task.pk), 'employee': employee.pk, 'duration': duration,
+                           'start': start.isoformat(), 'end': (start + timedelta(minutes=duration)).isoformat()}
+                key = uuid.uuid4()
+                self.command(order, command, payload, key)
+                self.command(order, command, payload, key)
+                task.refresh_from_db()
+                self.assertEqual(task.estimated_duration_minutes, duration)
+                self.assertEqual(task.planned_start, start)
+                self.assertEqual(task.assignment_mode, 'MANUAL')
+                self.assertTrue(task.locked)
+                kind = 'PLANNING_ESTIMATE' if index == 1 else 'PLANNING_RESCHEDULE'
+                self.assertEqual(PlanningEvent.objects.filter(task=task, kind=kind).count(), 1)
+
     def test_rework_preserves_completed_history_and_creates_new_attempt(self):
         self.employee();order=self.cao_case();recalculate(now=NOW);task=self.task(order)
         self.command(order,'planning-start',{'task':str(task.pk)})
@@ -560,7 +582,9 @@ class PlanningConcurrencyTests(TransactionTestCase):
                     # Raw concurrent GiST inserts can choose a deadlock victim
                     # instead of an exclusion violation. Application commands
                     # avoid this race with the tenant planning advisory lock.
-                    if getattr(exc.__cause__,'sqlstate',None) == '40P01':
+                    # psycopg 3 exposes sqlstate; the installed psycopg2 uses pgcode.
+                    cause = exc.__cause__
+                    if (getattr(cause,'sqlstate',None) or getattr(cause,'pgcode',None)) == '40P01':
                         return 'rejected'
                     raise
                 finally:

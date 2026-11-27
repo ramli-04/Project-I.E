@@ -3,20 +3,11 @@ from copy import copy
 from django.core.exceptions import ValidationError
 
 from .workflow import next_status
+from .workflow_spec import Action, derived_manufacturing, derived_rework_origins, derived_role_stages
 
-MANUFACTURING = {'USINAGE_CNC', 'IMPRESSION_3D', 'FABRICATION_MANUELLE', 'TRAITEMENT_THERMIQUE', 'FRITTAGE_9H'}
-REWORK_ORIGINS = {'SALLE_CAO', 'MODELE_TRAVAIL', 'COULEE_PLATRE', 'SCAN_LABO', 'CONTROLE_MODELE',
-                  'PREPARATION_CNC', 'PREPARATION_3D', 'MODELAGE', 'FINITION', 'CONTROLE_QUALITE',
-                  'LIVRE', 'ESSAYAGE', 'CLOTURE'} | MANUFACTURING | {'LAVAGE_SECHAGE', 'POST_POLYMERISATION'}
-ROLE_STAGES = {
-    'RECEPTION': {'DEMANDE_RECUE', 'ANALYSE_DEMANDE', 'A_CONFIRMER', 'CONTROLE_DOSSIER', 'PLANIFICATION',
-                  'COULEE_PLATRE', 'SCAN_LABO', 'CONTROLE_MODELE', 'RETOUR_DEMANDE'},
-    'CAO': {'SALLE_CAO', 'VALIDATION_CAO'},
-    'FAO': MANUFACTURING | {'PREPARATION_CNC', 'PREPARATION_3D', 'MODELAGE', 'MODELE_TRAVAIL',
-                          'FINITION', 'LAVAGE_SECHAGE', 'POST_POLYMERISATION', 'A_REFAIRE', 'RECOULER', 'RESCANNER'},
-    'QUALITE': {'CONTROLE_QUALITE', 'CONDITIONNEMENT'},
-    'COURIER': {'ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO', 'PRET_EXPEDITION', 'EN_ROUTE_CABINET'},
-}
+MANUFACTURING = derived_manufacturing()
+REWORK_ORIGINS = derived_rework_origins()
+ROLE_STAGES = derived_role_stages()
 
 
 def latest_inspection(order, stage):
@@ -51,7 +42,7 @@ def validate_source_change(order, previous, fields):
             if written(field) and getattr(order, field) != previous[field]:
                 raise ValidationError('The production route is locked after planning.')
     if written('billing_stage') and order.billing_stage == 'FACTURE' and previous['billing_stage'] != 'FACTURE':
-        if metadata.get('action') != 'ISSUE_INVOICE' or metadata.get('role') not in {'MANAGER', 'COMPTABILITE'}:
+        if metadata.get('action') != Action.ISSUE_INVOICE or metadata.get('role') not in {'MANAGER', 'COMPTABILITE'}:
             raise ValidationError('Issue invoices through monthly closing.')
     if previous['invoiced_at'] and written('is_fast_track') and order.is_fast_track != previous['is_fast_track']:
         raise ValidationError('Issued urgency pricing cannot be changed.')
@@ -65,30 +56,30 @@ def validate_source_change(order, previous, fields):
         return
     old = previous['status']
     role = metadata.get('role', 'SYSTEM')
-    action = metadata.get('action', 'TRANSITION')
+    action = metadata.get('action', Action.TRANSITION)
     if role not in {'MANAGER', 'SYSTEM'}:
-        special = ((role == 'DENTIST' and action in {'DESIGN_DECISION', 'FITTING', 'RESUBMIT'})
-                   or (role == 'DENTIST' and action == 'CONFIRM_DELIVERY' and old == 'EN_ROUTE_CABINET' and order.status == 'LIVRE')
-                   or (action == 'REWORK' and role in {'RECEPTION', 'CAO', 'FAO', 'QUALITE', 'DENTIST'}))
+        special = ((role == 'DENTIST' and action in {Action.DESIGN_DECISION, Action.FITTING, Action.RESUBMIT})
+                   or (role == 'DENTIST' and action == Action.CONFIRM_DELIVERY and old == 'EN_ROUTE_CABINET' and order.status == 'LIVRE')
+                   or (action == Action.REWORK and role in {'RECEPTION', 'CAO', 'FAO', 'QUALITE', 'DENTIST'}))
         if not special and old not in ROLE_STAGES.get(role, set()):
             raise ValidationError('Your workstation cannot perform this transition.')
-    if order.is_paused and action not in {'DESIGN_REQUEST', 'DESIGN_DECISION', 'REWORK'}:
+    if order.is_paused and action not in {Action.DESIGN_REQUEST, Action.DESIGN_DECISION, Action.REWORK}:
         raise ValidationError('Resume the case before advancing.')
     if not order.accepted:
         raise ValidationError('Accept the case before advancing.')
     before = copy(order)
     before.status = old
     if order.status in {'A_REFAIRE', 'RECOULER', 'RESCANNER'}:
-        if old not in REWORK_ORIGINS or action != 'REWORK' or not metadata.get('cause') or not metadata.get('corrective_action'):
+        if old not in REWORK_ORIGINS or action != Action.REWORK or not metadata.get('cause') or not metadata.get('corrective_action'):
             raise ValidationError('Use the rework command with origin, cause, action and measured losses.')
     elif order.status == 'RETOUR_DEMANDE':
-        if action != 'INSPECTION_FAILED' or old not in {'A_CONFIRMER', 'CONTROLE_DOSSIER', 'CONTROLE_MODELE'}:
+        if action != Action.INSPECTION_FAILED or old not in {'A_CONFIRMER', 'CONTROLE_DOSSIER', 'CONTROLE_MODELE'}:
             raise ValidationError('A failed intake inspection is required.')
     elif old == 'VALIDATION_CAO' and order.status == 'SALLE_CAO':
-        if action != 'DESIGN_DECISION':
+        if action != Action.DESIGN_DECISION:
             raise ValidationError('Only a design decision can return this case to CAO.')
     elif old == 'LIVRE' and order.status == 'CLOTURE':
-        if action != 'FITTING':
+        if action != Action.FITTING:
             raise ValidationError('Use the dentist fitting command.')
     elif order.status != next_status(before):
         raise ValidationError({'status': 'Advance to the next workflow step or use an explicit exception command.'})
@@ -105,14 +96,14 @@ def validate_source_change(order, previous, fields):
             require_inspection(order, 'QUALITY')
         if order.status in MANUFACTURING and not order.production_lots.exists():
             raise ValidationError('Link a production lot before fabrication.')
-        if order.status == 'VALIDATION_CAO' and action != 'DESIGN_REQUEST':
+        if order.status == 'VALIDATION_CAO' and action != Action.DESIGN_REQUEST:
             raise ValidationError('Submit a design version for dentist review.')
         if old == 'VALIDATION_CAO' and order.status != 'SALLE_CAO':
-            if action != 'DESIGN_DECISION' or not order.design_reviews.filter(production_attempt=order.production_attempt, status='APPROVED').exists():
+            if action != Action.DESIGN_DECISION or not order.design_reviews.filter(production_attempt=order.production_attempt, status='APPROVED').exists():
                 raise ValidationError('Dentist design approval is required.')
-    if order.status == 'LIVRE' and action != 'CONFIRM_DELIVERY':
+    if order.status == 'LIVRE' and action != Action.CONFIRM_DELIVERY:
         raise ValidationError('Use QR checkout and server-side PIN confirmation.')
-    custody_actions = {'ATTENTE_RAMASSAGE': 'PICKUP', 'EN_ROUTE_LABO': 'LAB-DEPOSIT', 'PRET_EXPEDITION': 'CHECKOUT'}
+    custody_actions = {'ATTENTE_RAMASSAGE': Action.PICKUP, 'EN_ROUTE_LABO': Action.LAB_DEPOSIT, 'PRET_EXPEDITION': Action.CHECKOUT}
     if old in custody_actions and action != custody_actions[old]:
         raise ValidationError('Use the authenticated QR custody command.')
     if old == 'PLANIFICATION' and (not order.production_method or not order.delivery_date):

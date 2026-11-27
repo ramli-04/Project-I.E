@@ -140,6 +140,201 @@ class BPMNAcceptanceTests(TenantTestCase):
         self.command(order, 'checkout', {'qr_token': qr_token(order)}, user=self.courier)
         self.command(order, 'confirm-delivery', {'pin': order._test_pin}, user=recipient or self.courier)
 
+    def inspection_checkpoint(self, stage):
+        """Reach a checkpoint through real commands, with no source/evidence bypass."""
+        from .case_commands import CHECKS
+        order = self.new_case(impression_type='PHYSIQUE' if stage in {'PHYSICAL', 'MODEL'} else 'NUMERIQUE')
+        self.command(order, 'accept')
+        self.command(order, 'advance', {'analysis_validated': True})
+        if order.impression_type == 'PHYSIQUE':
+            self.command(order, 'pickup', {'qr_token': qr_token(order)}, user=self.courier)
+            self.command(order, 'lab-deposit', {'qr_token': qr_token(order)}, user=self.courier)
+        else:
+            self.upload(order)
+        self.command(order, 'advance', {'reception_validated': True})
+        if stage in {'PHYSICAL', 'DIGITAL'}:
+            return order
+        intake = 'PHYSICAL' if order.impression_type == 'PHYSIQUE' else 'DIGITAL'
+        self.command(order, 'inspection', {'stage': intake, 'checks': dict.fromkeys(CHECKS[intake], True), 'advance': True})
+        if stage == 'MODEL':
+            self.command(order, 'advance')
+            self.command(order, 'advance')
+        else:
+            self.command(order, 'advance', {'production_method': 'CFAO', 'thermal_treatment': 'AUCUN', 'delivery_date': '2026-12-01'})
+            self.to_quality(order)
+        return order
+
+    def workstation_account(self, role):
+        with schema_context('public'):
+            return PlatformAccount.objects.create(name=role, login_key=uuid.uuid4().hex, role='LAB',
+                                                   laboratory=self.tenant, workstation_role=role)
+
+    def test_inspection_advance_checkpoints_record_evidence_audit_and_task_completion(self):
+        from .case_commands import CHECKS
+        from .workflow import next_status
+        for stage in CHECKS:
+            with self.subTest(stage=stage):
+                order = self.inspection_checkpoint(stage)
+                source, version, target = order.status, order.state_version, next_status(order)
+                task = order.planning_tasks.get(workflow_step=source, production_attempt=order.production_attempt,
+                                                intake_revision=order.intake_revision)
+                user = self.workstation_account('QUALITE' if stage == 'QUALITY' else 'RECEPTION')
+                data = {'stage': stage, 'checks': dict.fromkeys(CHECKS[stage], True), 'advance': True, 'notes': 'Inspection explicite'}
+                key = uuid.uuid4()
+                response = self.command(order, 'inspection', data, user=user, key=key)
+                result = response.data['result']
+                self.assertEqual(result, {'inspection_id': order.inspections.latest('pk').pk, 'passed': True,
+                                          'advanced': True, 'status': target})
+                self.assertEqual(order.status, target)
+                self.assertEqual(order.state_version, version + 1)
+                self.assertEqual(order.audit_history.latest('pk').metadata['action'], 'INSPECTION_ADVANCE')
+                task.refresh_from_db()
+                self.assertEqual(task.status, 'COMPLETED')
+                self.assertIsNotNone(task.actual_end)
+                if stage == 'QUALITY':
+                    self.assertTrue(order.quality_validated)
+                count, events = order.inspections.count(), order.audit_history.count()
+                retry = self.command(order, 'inspection', data, user=user, key=key)
+                self.assertEqual(retry.data['result'], result)
+                self.assertEqual(order.state_version, version + 1)
+                self.assertEqual(order.inspections.count(), count)
+                self.assertEqual(order.audit_history.count(), events)
+
+    def test_inspection_advance_wrong_owner_rejects_before_creating_evidence(self):
+        from .case_commands import CHECKS
+        for stage in ['PHYSICAL', 'DIGITAL', 'MODEL', 'QUALITY']:
+            with self.subTest(stage=stage):
+                order = self.inspection_checkpoint(stage)
+                count, version = order.inspections.count(), order.state_version
+                response = self.command(order, 'inspection', {'stage': stage, 'checks': dict.fromkeys(CHECKS[stage], True),
+                    'advance': True}, user=self.workstation_account('CAO'), expected=400)
+                self.assertIn('cannot validate and advance', str(response.data))
+                self.assertEqual(order.inspections.count(), count)
+                self.assertEqual(order.state_version, version)
+
+    def test_inspection_advance_reception_records_without_skipping_confirmation(self):
+        order = self.new_case()
+        self.command(order, 'accept')
+        self.command(order, 'advance', {'analysis_validated': True})
+        self.upload(order)
+        response = self.command(order, 'inspection', {'stage': 'DIGITAL',
+            'checks': dict.fromkeys(['margins', 'occlusion', 'space', 'scan_quality'], True), 'advance': True})
+        self.assertEqual(response.data['result']['advanced'], False)
+        self.assertEqual(order.status, 'A_CONFIRMER')
+        self.assertFalse(order.reception_validated)
+        self.assertEqual(order.inspections.count(), 1)
+
+    def test_inspection_advance_invalid_boolean_and_paused_case_roll_back(self):
+        order = self.inspection_checkpoint('MODEL')
+        data = {'stage': 'MODEL', 'checks': {'model': True, 'scan': True}}
+        for value in [None, 1, 0, 'true', [], {}]:
+            self.command(order, 'inspection', {**data, 'advance': value}, expected=400)
+        self.assertFalse(order.inspections.filter(stage='MODEL').exists())
+        self.command(order, 'pause', {'paused': True, 'notes': 'Pause explicite'})
+        version = order.state_version
+        self.command(order, 'inspection', {**data, 'advance': True}, expected=400)
+        self.assertFalse(order.inspections.filter(stage='MODEL').exists())
+        self.assertEqual(order.status, 'CONTROLE_MODELE')
+        self.assertEqual(order.state_version, version)
+        self.assertTrue(order.is_paused)
+
+    def test_inspection_advance_equipment_guard_rolls_back_evidence(self):
+        order = self.inspection_checkpoint('MODEL')
+        task = order.planning_tasks.get(workflow_step='CONTROLE_MODELE')
+        task.resource_phase = 'PLANNED'
+        task.setup_minutes, task.unload_minutes = 5, 5
+        task.save()
+        response = self.command(order, 'inspection', {'stage': 'MODEL', 'checks': {'model': True, 'scan': True},
+            'advance': True}, expected=400)
+        self.assertIn('cycle autonome', str(response.data))
+        self.assertFalse(order.inspections.filter(stage='MODEL').exists())
+        self.assertEqual(order.status, 'CONTROLE_MODELE')
+
+    def test_inspection_without_advance_retains_record_only_contract(self):
+        order = self.inspection_checkpoint('MODEL')
+        data = {'stage': 'MODEL', 'checks': {'model': True, 'scan': True}}
+        response = self.command(order, 'inspection', data)
+        self.assertEqual(set(response.data['result']), {'inspection_id', 'passed'})
+        self.assertEqual(order.status, 'CONTROLE_MODELE')
+        response = self.command(order, 'inspection', {**data, 'advance': False})
+        self.assertFalse(response.data['result']['advanced'])
+        self.assertEqual(order.status, 'CONTROLE_MODELE')
+
+    def test_failed_inspection_does_not_advance_and_preserves_exception_routes(self):
+        from .case_commands import CHECKS
+        for stage in CHECKS:
+            with self.subTest(stage=stage):
+                order = self.inspection_checkpoint(stage)
+                status = order.status
+                data = {'stage': stage, 'checks': dict.fromkeys(CHECKS[stage], False),
+                        'notes': 'Non-conformite explicite', 'advance': True}
+                self.command(order, 'inspection', data, expected=400)
+                data['photo'] = self.upload(order, 'PHOTO')
+                response = self.command(order, 'inspection', data)
+                self.assertFalse(response.data['result']['advanced'])
+                self.assertFalse(response.data['result']['passed'])
+                self.assertEqual(order.status, 'RETOUR_DEMANDE' if stage in {'PHYSICAL', 'DIGITAL'} else status)
+
+    def test_accept_command_preserves_acceptance_effects_and_is_idempotent(self):
+        from .models import TenantReadVersion
+        order = self.new_case()
+        version = TenantReadVersion.objects.get(name='active_orders').version
+        self.assertFalse(order.planning_tasks.exists())
+        key = uuid.uuid4()
+        response = self.command(order, 'accept', {'notes': 'Prescription revue'}, user=self.workstation_account('RECEPTION'), key=key)
+        self.assertEqual(response.data['result'], {'status': 'ANALYSE_DEMANDE'})
+        self.assertTrue(order.accepted)
+        self.assertIsNotNone(order.accepted_at)
+        self.assertFalse(order.analysis_validated)
+        self.assertTrue(order.planning_tasks.filter(workflow_step='ANALYSE_DEMANDE').exists())
+        self.assertTrue(order.task_events.filter(event_type='PLANNING').exists())
+        self.assertTrue(order.task_events.filter(event_type='CACHE').exists())
+        self.assertEqual(order.audit_history.latest('pk').metadata['action'], 'ACCEPT')
+        self.assertGreater(TenantReadVersion.objects.get(name='active_orders').version, version)
+        history_count, tasks_count, accepted_at = order.audit_history.count(), order.planning_tasks.count(), order.accepted_at
+        self.assertEqual(self.command(order, 'accept', {'notes': 'Prescription revue'}, key=key).data['result'], response.data['result'])
+        self.assertEqual(order.audit_history.count(), history_count)
+        self.assertEqual(order.planning_tasks.count(), tasks_count)
+        self.assertEqual(order.accepted_at, accepted_at)
+        self.command(order, 'accept', expected=400)
+
+    def test_accept_command_rejects_non_reception_and_retains_patch_compatibility(self):
+        order = self.new_case()
+        self.command(order, 'accept', user=self.workstation_account('CAO'), expected=400)
+        self.assertFalse(order.accepted)
+        self.assertFalse(order.planning_tasks.exists())
+        self.patch(order, accepted=True)
+        self.assertIsNotNone(order.accepted_at)
+        self.command(order, 'accept', expected=400)
+        self.command(order, 'advance')
+        self.assertEqual(order.status, 'ANALYSE_DEMANDE')
+
+    def test_accept_command_paused_case_rolls_back_acceptance_and_planning(self):
+        order = self.new_case()
+        self.command(order, 'pause', {'paused': True, 'notes': 'Attente explicite'})
+        self.command(order, 'accept', expected=400)
+        self.assertFalse(order.accepted)
+        self.assertIsNone(order.accepted_at)
+        self.assertFalse(order.planning_tasks.exists())
+        self.assertEqual(order.status, 'DEMANDE_RECUE')
+
+    def test_courier_list_and_command_return_server_labels_without_clinical_fields(self):
+        from .workflow import LABELS
+        order = self.new_case(impression_type='PHYSIQUE')
+        self.command(order, 'accept')
+        self.command(order, 'advance', {'analysis_validated': True})
+        self.client.force_authenticate(user=self.courier)
+        response = self.client.get('/api/prescriptions/')
+        self.assertEqual(response.status_code, 200, response.data)
+        row = next(row for row in response.data['results'] if str(row['id']) == str(order.pk))
+        self.assertEqual(row['status_label'], LABELS['ATTENTE_RAMASSAGE'])
+        self.assertNotIn('clinical_items', row)
+        self.assertNotIn('delivery_pin_hash', row)
+        self.assertNotIn('workstation_notes', row)
+        response = self.command(order, 'pickup', {'qr_token': qr_token(order)}, user=self.courier)
+        self.assertEqual(response.data['case']['status_label'], LABELS['EN_ROUTE_LABO'])
+        self.assertEqual(set(response.data['case']), set(row))
+
     def test_missing_password_unknown_token_and_cross_tenant_access_are_denied(self):
         self.client.force_authenticate(user=None)
         self.assertEqual(self.client.post('/platform/login/', {'name': 'Manager'}, format='json').status_code, 401)
@@ -266,6 +461,10 @@ class BPMNAcceptanceTests(TenantTestCase):
                                 quantity_changed=Decimal('-2'), idempotency_key=uuid.uuid4(), changed_by='operator')
         self.deliver(order)
         self.assertEqual(order.status, 'LIVRE')
+        self.command(order, 'fitting', {'passed': False}, user=self.dentist, expected=400)
+        self.assertEqual(order.status, 'LIVRE')
+        self.assertIsNone(order.fitting_validated_at)
+        self.assertFalse(order.reworks.exists())
         # Dentist initiates remake post-delivery with no measured losses
         self.command(order, 'rework', {'origin': 'CLINIC', 'cause': 'Occlusion issue', 'corrective_action': 'Rework CAD',
                                        'restart_status': 'SALLE_CAO', 'losses': []}, user=self.dentist)
@@ -403,6 +602,291 @@ class BPMNAcceptanceTests(TenantTestCase):
         self.assertEqual(order.status,'LIVRE')
         from .models import StatementLine
         self.assertEqual(StatementLine.objects.filter(prescription=order).count(),1)
+
+    def test_pin_rotation_delivery_actions_and_dispute_retries_keep_existing_contract(self):
+        from django.contrib.auth.hashers import check_password
+        from .models import BillingDispute, CaseCommandReceipt, WorkflowEvent
+
+        order = self.new_case()
+        self.command(order, 'issue-pin', expected=400)
+        key = uuid.uuid4()
+        issued = self.command(order, 'issue-pin', user=self.dentist, key=key)
+        pin = issued.data['result']['pin_once']
+        self.assertTrue(check_password(pin, order.delivery_pin_hash))
+        self.assertEqual(self.command(order, 'issue-pin', user=self.dentist, key=key).data['result'], {})
+        self.assertNotIn('pin_once', CaseCommandReceipt.objects.get(pk=key).result)
+        self.assertEqual(WorkflowEvent.objects.filter(prescription=order).latest('created_at').payload['action'], 'ISSUE-PIN')
+
+        self.to_cao(order)
+        self.to_quality(order)
+        self.command(order, 'inspection', {'stage': 'QUALITY', 'checks': dict.fromkeys(
+            ['margins', 'contacts', 'shade', 'occlusion', 'cosmetic', 'glazing', 'polishing'], True)})
+        self.patch(order, status='CONDITIONNEMENT')
+        self.patch(order, status='PRET_EXPEDITION')
+        self.command(order, 'checkout', {'qr_token': qr_token(order)}, user=self.courier)
+        wrong = '0000' if pin != '0000' else '1111'
+        failed_key = uuid.uuid4()
+        self.command(order, 'confirm-delivery', {'pin': wrong}, user=self.courier, key=failed_key, expected=400)
+        self.command(order, 'confirm-delivery', {'pin': wrong}, user=self.courier, key=failed_key, expected=400)
+        self.assertEqual(order.pin_attempts, 1)
+        self.assertEqual(WorkflowEvent.objects.filter(prescription=order).latest('created_at').payload['action'], 'CONFIRM-DELIVERY')
+        self.command(order, 'confirm-delivery', {'pin': pin}, user=self.courier)
+        self.assertEqual(order.audit_history.latest('pk').metadata['action'], 'CONFIRM_DELIVERY')
+
+        key = uuid.uuid4()
+        payload = {'notes': 'Montant à vérifier avec le laboratoire'}
+        first = self.command(order, 'dispute', payload, user=self.dentist, key=key)
+        retry = self.command(order, 'dispute', payload, user=self.dentist, key=key)
+        self.assertEqual(first.data['result'], retry.data['result'])
+        self.assertEqual(BillingDispute.objects.filter(prescription=order).count(), 1)
+        self.assertTrue(order.statement_line.contested)
+        self.assertEqual(WorkflowEvent.objects.filter(prescription=order).latest('created_at').payload['action'], 'DISPUTE')
+
+    def test_physical_return_requires_a_new_revision_inspection_after_resubmission(self):
+        from .case_commands import CHECKS
+        order = self.inspection_checkpoint('PHYSICAL')
+        photo = self.upload(order, 'PHOTO')
+        checks = dict.fromkeys(CHECKS['PHYSICAL'], True)
+        checks['limits'] = False
+        self.command(order, 'inspection', {'stage': 'PHYSICAL', 'checks': checks,
+            'photo': photo, 'notes': 'Limites imprécises', 'advance': True})
+        self.assertEqual(order.status, 'RETOUR_DEMANDE')
+        failed = order.inspections.get(stage='PHYSICAL')
+        self.assertFalse(failed.passed)
+        self.assertTrue(order.notifications.filter(kind='INSPECTION_FAILED').exists())
+        self.command(order, 'resubmit', user=self.dentist)
+        self.assertEqual(order.intake_revision, 2)
+        self.assertFalse(order.reception_validated)
+        self.command(order, 'advance', {'reception_validated': True})
+        self.command(order, 'advance', expected=400)
+        self.assertEqual(order.status, 'CONTROLE_DOSSIER')
+        self.command(order, 'inspection', {'stage': 'PHYSICAL',
+            'checks': dict.fromkeys(CHECKS['PHYSICAL'], True), 'advance': True})
+        self.assertEqual(order.status, 'COULEE_PLATRE')
+        self.assertEqual(order.inspections.get(stage='PHYSICAL', passed=True).intake_revision, 2)
+        failed.refresh_from_db()
+        self.assertEqual(failed.intake_revision, 1)
+        self.assertFalse(failed.passed)
+
+    def test_failed_model_can_be_repoured_or_rescanned_with_measured_loss(self):
+        for restart, exception in [('COULEE_PLATRE', 'RECOULER'), ('SCAN_LABO', 'RESCANNER')]:
+            with self.subTest(restart=restart):
+                order = self.inspection_checkpoint('MODEL')
+                photo = self.upload(order, 'PHOTO')
+                self.command(order, 'inspection', {'stage': 'MODEL', 'checks': {'model': False, 'scan': True},
+                    'photo': photo, 'notes': 'Modèle à reprendre', 'advance': True})
+                self.assertEqual(order.status, 'CONTROLE_MODELE')
+                item = Inventory.objects.create(material_name='Plâtre de test', quantity='10', unit='GRAMMES',
+                                                alert_threshold='1', unit_cost='2')
+                usage = record_movement(inventory_item=item, prescription=order, transaction_type='USAGE',
+                    quantity_changed=Decimal('-1.25'), idempotency_key=uuid.uuid4())
+                data = {'origin': 'LAB', 'cause': 'Modèle non conforme', 'corrective_action': 'Reprendre le modèle',
+                        'restart_status': restart, 'losses': [{'usage_id': str(usage.pk), 'quantity': '0.25'}]}
+                key = uuid.uuid4()
+                self.command(order, 'rework', data, key=key)
+                self.command(order, 'rework', data, key=key)
+                self.assertEqual(order.status, exception)
+                self.assertEqual(order.production_attempt, 2)
+                rework = order.reworks.get()
+                self.assertEqual((rework.cause_step, rework.restart_status, rework.attempt),
+                                 ('CONTROLE_MODELE', restart, 1))
+                item.refresh_from_db()
+                self.assertEqual(item.quantity, Decimal('8.75'))
+                self.assertEqual(item.transactions.get(transaction_type='REWORK_LOSS').quantity_changed, Decimal('-0.25'))
+                self.command(order, 'advance')
+                self.assertEqual(order.status, restart)
+                if restart == 'COULEE_PLATRE':
+                    self.command(order, 'advance')
+                self.command(order, 'advance')
+                self.assertEqual(order.status, 'CONTROLE_MODELE')
+                self.command(order, 'advance', expected=400)
+                self.command(order, 'inspection', {'stage': 'MODEL', 'checks': {'model': True, 'scan': True}, 'advance': True})
+                self.assertEqual(order.status, 'PLANIFICATION')
+
+    def test_design_changes_keep_the_hold_until_a_new_version_is_approved(self):
+        order = self.new_case(design_validation_requested=True)
+        self.to_cao(order)
+        first = self.upload(order, 'DESIGN')
+        self.command(order, 'design-request', {'attachment': first})
+        review = order.design_reviews.get()
+        data = {'review': str(review.pk), 'decision': 'CHANGES_REQUESTED'}
+        self.command(order, 'design-decision', data, user=self.dentist, expected=400)
+        self.assertEqual(order.status, 'VALIDATION_CAO')
+        self.command(order, 'design-decision', {**data, 'notes': 'Corriger les contacts'}, user=self.dentist)
+        self.assertEqual(order.status, 'SALLE_CAO')
+        self.assertTrue(order.is_paused)
+        review.refresh_from_db()
+        self.assertEqual(review.status, 'CHANGES_REQUESTED')
+        self.assertEqual(review.response_notes, 'Corriger les contacts')
+        self.command(order, 'advance', expected=400)
+        second = self.upload(order, 'DESIGN')
+        self.command(order, 'design-request', {'attachment': second})
+        revised = order.design_reviews.get(status='PENDING')
+        self.assertEqual(revised.version, 2)
+        self.assertEqual(revised.production_attempt, review.production_attempt)
+        self.command(order, 'design-decision', {'review': str(revised.pk), 'decision': 'APPROVED'}, user=self.dentist)
+        self.assertEqual(order.status, 'PREPARATION_CNC')
+        self.assertFalse(order.is_paused)
+        self.assertEqual(order.design_reviews.count(), 2)
+        self.assertEqual(order.notifications.filter(kind='DESIGN_DECISION').count(), 2)
+
+    def test_manufacturing_rework_keeps_the_case_lot_and_measured_loss(self):
+        order = self.new_case()
+        self.to_cao(order)
+        self.command(order, 'advance')
+        lot = ProductionLot.objects.create(code='REWORK-' + order.pk.hex)
+        lot.prescriptions.add(order)
+        self.command(order, 'advance')
+        self.assertEqual(order.status, 'USINAGE_CNC')
+        item = Inventory.objects.create(material_name='Brut de test', quantity='10', unit='DISQUE',
+                                        alert_threshold='1', unit_cost='50')
+        usage = record_movement(inventory_item=item, prescription=order, transaction_type='USAGE',
+            quantity_changed=Decimal('-1'), idempotency_key=uuid.uuid4())
+        count = Prescription.objects.count()
+        self.command(order, 'rework', {'origin': 'LAB', 'cause': 'Fracture pendant usinage',
+            'corrective_action': 'Refaire le parcours outil', 'restart_status': 'PREPARATION_CNC',
+            'losses': [{'usage_id': str(usage.pk), 'quantity': '1'}]})
+        self.assertEqual(order.status, 'A_REFAIRE')
+        self.assertEqual(Prescription.objects.count(), count)
+        self.assertEqual(order.production_attempt, 2)
+        self.assertEqual(order.reworks.get().cause_step, 'USINAGE_CNC')
+        self.assertTrue(order.production_lots.filter(pk=lot.pk).exists())
+        item.refresh_from_db()
+        self.assertEqual(item.quantity, Decimal('9'))
+        self.assertEqual(item.transactions.get(transaction_type='REWORK_LOSS').quantity_changed, Decimal('-1'))
+        notification = order.notifications.get(kind='REWORK')
+        self.assertEqual(notification.payload['original_case_id'], str(order.pk))
+        self.command(order, 'advance')
+        self.assertEqual(order.status, 'PREPARATION_CNC')
+
+    def test_failed_quality_restarts_at_the_selected_cause_step_and_requires_new_evidence(self):
+        from .case_commands import CHECKS
+        for restart in ('SALLE_CAO', 'PREPARATION_CNC', 'FINITION'):
+            with self.subTest(restart=restart):
+                order = self.inspection_checkpoint('QUALITY')
+                checks = dict.fromkeys(CHECKS['QUALITY'], True)
+                checks['contacts'] = False
+                self.command(order, 'inspection', {'stage': 'QUALITY', 'checks': checks,
+                    'photo': self.upload(order, 'PHOTO'), 'notes': 'Contacts non conformes', 'advance': True})
+                self.assertEqual(order.status, 'CONTROLE_QUALITE')
+                self.assertFalse(order.quality_validated)
+                self.command(order, 'rework', {'origin': 'LAB', 'cause': 'Contacts à corriger',
+                    'corrective_action': 'Corriger au poste concerné', 'restart_status': restart, 'losses': []})
+                rework = order.reworks.get()
+                self.assertEqual((rework.cause_step, rework.restart_status, rework.losses),
+                                 ('CONTROLE_QUALITE', restart, []))
+                self.command(order, 'advance')
+                self.assertEqual(order.status, restart)
+                for _ in range(5):
+                    if order.status == 'CONTROLE_QUALITE':
+                        break
+                    self.command(order, 'advance')
+                self.assertEqual(order.status, 'CONTROLE_QUALITE')
+                self.command(order, 'advance', expected=400)
+                self.assertFalse(order.quality_validated)
+                self.command(order, 'inspection', {'stage': 'QUALITY',
+                    'checks': dict.fromkeys(CHECKS['QUALITY'], True), 'advance': True})
+                self.assertEqual(order.status, 'CONDITIONNEMENT')
+                self.assertEqual(order.inspections.get(stage='QUALITY', passed=True).production_attempt, 2)
+
+    def test_open_statement_disputes_exclude_accepted_and_restore_rejected_lines(self):
+        from .models import BillingDispute
+        accountant = self.workstation_account('COMPTABILITE')
+        orders = []
+        with patch('django.utils.timezone.now', return_value=datetime(2026, 10, 10, 12, tzinfo=utc_timezone.utc)):
+            for service in ('STANDARD', 'EXPRESS'):
+                order = self.new_case(delivery_service=service)
+                self.to_cao(order)
+                self.to_quality(order)
+                self.deliver(order)
+                self.command(order, 'dispute', {'notes': 'Montant à vérifier'}, user=self.dentist)
+                orders.append(order)
+        excluded, restored = orders
+        period = excluded.statement_line.period
+        disputes = {order.pk: BillingDispute.objects.get(prescription=order) for order in orders}
+        self.client.force_authenticate(user=accountant)
+        with patch('django.utils.timezone.now', return_value=datetime(2026, 11, 4, 12, tzinfo=utc_timezone.utc)):
+            blocked = self.client.post(f'/api/billing/periods/{period.pk}/close/', {}, format='json')
+            self.assertEqual(blocked.status_code, 400, blocked.data)
+            self.assertFalse(FinanceInvoice.objects.exists())
+            for order, decision in [(excluded, 'ACCEPTED'), (restored, 'REJECTED')]:
+                resolved = self.client.post(f'/api/billing/disputes/{disputes[order.pk].pk}/resolve/',
+                    {'decision': decision, 'notes': 'Décision comptable documentée'}, format='json')
+                self.assertEqual(resolved.status_code, 200, resolved.data)
+                self.assertEqual(resolved.data['status'], decision)
+            closed = self.client.post(f'/api/billing/periods/{period.pk}/close/', {}, format='json')
+            self.assertEqual(closed.status_code, 200, closed.data)
+        excluded.refresh_from_db()
+        restored.refresh_from_db()
+        self.assertTrue(excluded.statement_line.contested)
+        self.assertTrue(excluded.statement_line.excluded)
+        self.assertFalse(restored.statement_line.contested)
+        self.assertFalse(restored.statement_line.excluded)
+        self.assertIsNone(excluded.invoiced_at)
+        self.assertIsNotNone(restored.invoiced_at)
+        invoice = FinanceInvoice.objects.get(pk=closed.data['id'])
+        self.assertEqual([line['case_id'] for line in invoice.lines], [str(restored.pk)])
+        self.assertEqual(invoice.total_amount, Decimal('1560'))
+        self.assertEqual(invoice.express_surcharge, Decimal('360'))
+        self.assertFalse(CreditNote.objects.exists())
+        invalid_credit = self.client.post(f'/api/billing/invoices/{invoice.pk}/credit/',
+            {'prescription': str(excluded.pk), 'amount': '10', 'reason': 'Ligne exclue'},
+            format='json', HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()))
+        self.assertEqual(invalid_credit.status_code, 400, invalid_credit.data)
+        self.assertFalse(CreditNote.objects.exists())
+
+    def test_issued_statement_dispute_creates_one_bounded_credit_and_keeps_invoice_immutable(self):
+        from copy import deepcopy
+        from .models import BillingDispute
+        accountant = self.workstation_account('COMPTABILITE')
+        with patch('django.utils.timezone.now', return_value=datetime(2026, 10, 10, 12, tzinfo=utc_timezone.utc)):
+            order = self.new_case(delivery_service='EXPRESS')
+            self.to_cao(order)
+            self.to_quality(order)
+            self.deliver(order)
+        with patch('django.utils.timezone.now', return_value=datetime(2026, 11, 4, 12, tzinfo=utc_timezone.utc)):
+            invoice = close_period(order.statement_line.period_id, 'test:accountant')
+        snapshot = deepcopy(invoice.lines)
+        self.command(order, 'dispute', {'notes': 'Correction après émission'}, user=self.dentist)
+        dispute = BillingDispute.objects.get(prescription=order)
+        self.assertEqual(dispute.invoice_id, invoice.pk)
+        url = f'/api/billing/disputes/{dispute.pk}/resolve/'
+        decision = {'decision': 'ACCEPTED', 'notes': 'Correction approuvée', 'amount': '100'}
+        self.client.force_authenticate(user=self.dentist)
+        self.assertEqual(self.client.post(url, decision, format='json').status_code, 403)
+        self.client.force_authenticate(user=accountant)
+        for amount in ('0', '1560.01'):
+            invalid = self.client.post(url, {**decision, 'amount': amount}, format='json')
+            self.assertEqual(invalid.status_code, 400, invalid.data)
+            dispute.refresh_from_db()
+            self.assertEqual(dispute.status, 'OPEN')
+            self.assertFalse(CreditNote.objects.exists())
+        resolved = self.client.post(url, decision, format='json')
+        self.assertEqual(resolved.status_code, 200, resolved.data)
+        self.assertEqual(resolved.data['status'], 'ACCEPTED')
+        self.assertEqual(self.client.post(url, decision, format='json').status_code, 400)
+        credit = CreditNote.objects.get(invoice=invoice)
+        self.assertEqual(credit.amount, Decimal('100'))
+        repeated = self.client.post(f'/api/billing/invoices/{invoice.pk}/credit/',
+            {'prescription': str(order.pk), 'amount': '100', 'reason': decision['notes']}, format='json',
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid5(uuid.NAMESPACE_URL, f'dispute:{dispute.pk}')))
+        self.assertEqual(repeated.status_code, 201, repeated.data)
+        self.assertEqual(str(credit.pk), repeated.data['id'])
+        self.assertEqual(CreditNote.objects.filter(invoice=invoice).count(), 1)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.total_amount, Decimal('1560'))
+        self.assertEqual(invoice.lines, snapshot)
+        edited = self.client.post(f'/api/billing/statement-lines/{order.statement_line.pk}/adjust/',
+            {'contested': True, 'excluded': True, 'reason': 'Émission immuable'}, format='json')
+        self.assertEqual(edited.status_code, 400, edited.data)
+        event = order.task_events.get(event_type='CREDIT')
+        self.assertEqual(generate_credit_note_pdf_task(self.tenant.schema_name, str(order.pk), str(event.pk))['status'], 'PDF_READY')
+        pdf = self.client.get(f'/api/billing/credit-notes/{credit.pk}/pdf/')
+        self.assertEqual(pdf.status_code, 200)
+        self.assertTrue(b''.join(pdf.streaming_content).startswith(b'%PDF-'))
+        refresh_billing_catalog(self.tenant.schema_name)
+        self.assertEqual(MonthlyFinancialCatalog.objects.get().net_amount, Decimal('1460'))
+        self.assertTrue(order.notifications.filter(kind='CREDIT_ISSUED').exists())
 
     def test_monthly_closing_real_pdf_and_credit_catalog(self):
         october = datetime(2026,10,10,12,tzinfo=utc_timezone.utc)

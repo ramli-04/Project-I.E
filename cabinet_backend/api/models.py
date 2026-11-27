@@ -1,3 +1,4 @@
+from django.core.validators import MaxValueValidator
 import random
 import uuid
 from django.conf import settings
@@ -113,6 +114,7 @@ class PartnerClinic(models.Model):
     contact_phone = models.CharField(max_length=30)
     contact_email = models.EmailField(blank=True)
     platform_dentist = models.ForeignKey('customers.PlatformAccount', null=True, blank=True, on_delete=models.PROTECT, related_name='clinics')
+    payment_terms_days = models.PositiveSmallIntegerField(default=60, validators=[MaxValueValidator(120)])
     linked_dentist = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='partner_clinics',
@@ -122,6 +124,7 @@ class PartnerClinic(models.Model):
         ordering = ['name', 'pk']
         constraints = [
             models.CheckConstraint(condition=~models.Q(pickup_address=''), name='clinic_required_pickup_address'),
+            models.CheckConstraint(condition=models.Q(payment_terms_days__gte=0, payment_terms_days__lte=120), name='clinic_payment_terms_range'),
         ]
 
 
@@ -682,7 +685,9 @@ from .business_models import (  # noqa: E402,F401 -- register tenant models with
     ReworkCase, BillingPeriod, StatementLine, FinanceInvoice, InvoiceDocument, CreditNote,
     CaseNotification, MessageDelivery, TenantReadVersion, MonthlyStatementCatalog,
     CaseCommandReceipt, BillingDispute,
-    CreditDocument, MonthlyFinancialCatalog,
+    CreditDocument, MonthlyFinancialCatalog, Payment, PaymentAllocation, PaymentReversal,
 )
 
 from .planning_models import (PlanningSettings, PlanningTask, EmployeeAvailability, EmployeeQualification, PlanningEvent)  # noqa: E402,F401
+
+from .laboratory_models import LaboratoryProfile  # noqa: E402,F401

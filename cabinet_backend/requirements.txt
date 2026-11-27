@@ -8,3 +8,7 @@ celery[redis]==5.6.3
 redis==8.1.0
 reportlab==5.1.0
 qrcode[pil]==8.2
+# Explicit pins (previously transitive): images for QR/PDF/proof photos, and the
+# Africa/Casablanca time zone database required on Windows native installs.
+pillow==13.0.0
+tzdata==2026.6

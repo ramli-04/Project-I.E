@@ -24,11 +24,11 @@ from .planning_models import (ACTIVE_BOOKINGS, EmployeeAvailability, PlanningEve
 from .planning_phases import (attended_intervals,
                               equipment_slot, phase_bookings, validate_attended)
 from .workflow import LABELS, next_status, workflow_steps
+from .workflow_spec import Action, derived_external
 
 TZ = ZoneInfo('Africa/Casablanca')
 TERMINAL = {'COMPLETED', 'CANCELLED'}
-EXTERNAL = {'ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO', 'PRET_EXPEDITION', 'EN_ROUTE_CABINET',
-            'VALIDATION_CAO', 'LIVRE', 'ESSAYAGE', 'CLOTURE', 'RETOUR_DEMANDE'}
+EXTERNAL = derived_external()
 DEFAULT_RULES = {
     'ANALYSE_DEMANDE': ('RECEPTION', 20, ''), 'A_CONFIRMER': ('RECEPTION', 15, ''),
     'CONTROLE_DOSSIER': ('RECEPTION', 20, ''), 'COULEE_PLATRE': ('RECEPTION', 45, ''),
@@ -177,7 +177,7 @@ def source_saved(order, previous=None):
         from .signals import _audit_details, _workflow_metadata
         actor = _audit_details.get()[0]
         sync_order(order, actor, previous_status=previous['status'] if previous else None,
-                   allow_unstarted_cancel=_workflow_metadata.get().get('action') == 'REWORK')
+                   allow_unstarted_cancel=_workflow_metadata.get().get('action') == Action.REWORK)
         request_replan(order)
 
 
@@ -333,6 +333,37 @@ def interval_valid(task, employee, start, end, settings, bookings, machine=None,
             raise ValidationError('Le créneau précède la fin d’une dépendance.')
 
 
+def ordered_jobs(tasks, settings, now):
+    """Shared deterministic job ordering for scheduling and read-only projections."""
+    by_order = {}
+    for task in tasks:
+        by_order.setdefault(task.prescription_id, []).append(task)
+    return sorted(by_order.values(), key=lambda group: (
+        -max(t.priority for t in group),
+        (deadline(group[0].prescription, settings)-now).total_seconds()/60
+        - sum(t.estimated_duration_minutes for t in group),
+        str(group[0].prescription_id)))
+
+
+def candidate_slot(task, order, earliest, settings, bookings, employees, machines):
+    """The scheduler's candidate policy; no persistence or resource locks."""
+    candidates = []
+    equipment = [(m, slot) for m in machines if m.machine_type == task.machine_type
+                 for slot in range(1, m.capacity+1)] if task.machine_type else [(None, 1)]
+    for employee in employees:
+        if employee.role != task.required_role:
+            continue
+        for machine, slot in equipment:
+            interval = slot_for(employee, task, machine, slot, earliest, settings, bookings)
+            if interval:
+                start, end = interval
+                score, components = explain_score(employee, task, start, earliest, settings, bookings)
+                candidates.append((max(0, (end-deadline(order, settings)).total_seconds()),
+                    -score, start, employee.pk, machine.pk if machine else 0,
+                    slot, end, employee, machine, components))
+    return min(candidates, key=lambda c: c[:6]) if candidates else None
+
+
 @transaction.atomic
 def recalculate(*, actor='system', now=None):
     now = now or timezone.now()
@@ -384,12 +415,7 @@ def recalculate(*, actor='system', now=None):
                 task.blocking_reason = 'Affectation conservée — conflit à résoudre : ' + str(exc)
             task.save(update_fields=['blocking_reason','updated_at'])
     # Keep each order topological, then order entire jobs by urgency and remaining slack.
-    by_order = {}
-    for task in tasks: by_order.setdefault(task.prescription_id, []).append(task)
-    jobs = sorted(by_order.values(), key=lambda group: (
-        -max(t.priority for t in group),
-        (deadline(group[0].prescription,settings)-now).total_seconds()/60-sum(t.estimated_duration_minutes for t in group),
-        str(group[0].prescription_id)))
+    jobs = ordered_jobs(tasks, settings, now)
     by_id = {t.pk:t for t in tasks}
     changed, blocked = 0, 0
     for group in jobs:
@@ -405,25 +431,17 @@ def recalculate(*, actor='system', now=None):
             elif any(not d.planned_end for d in waiting): reason = 'Dépendance bloquée ou validation externe en attente.'
             elif order.delivery_service == 'NEXT_DAY' and order.total_price is None and task.sequence > 10: reason = 'Devis manuel J+1 non validé.'
             earliest = max([now, *[d.planned_end for d in waiting if d.planned_end]])
-            candidates = []
+            candidate = None
             if not reason:
-                equipment = [(m,slot) for m in machines if m.machine_type == task.machine_type for slot in range(1,m.capacity+1)] if task.machine_type else [(None,1)]
-                for employee in employees:
-                    if employee.role != task.required_role: continue
-                    for machine, slot in equipment:
-                        interval = slot_for(employee,task,machine,slot,earliest,settings,bookings)
-                        if interval:
-                            start,end = interval
-                            score,components = explain_score(employee,task,start,earliest,settings,bookings)
-                            candidates.append((max(0,(end-deadline(order,settings)).total_seconds()),-score,start,employee.pk,
-                                               machine.pk if machine else 0,slot,end,employee,machine,components))
-                if not candidates: reason = 'Aucun créneau compatible : rôle, qualifications, absence ou capacité indisponible dans l’horizon.'
+                candidate = candidate_slot(task, order, earliest, settings, bookings, employees, machines)
+                if candidate is None:
+                    reason = 'Aucun créneau compatible : rôle, qualifications, absence ou capacité indisponible dans l’horizon.'
             if reason:
                 task.status, task.blocking_reason = 'BLOCKED', reason
                 task.assignment_explanation = {'reason': reason}
                 blocked += 1
             else:
-                _,neg_score,start,_,_,slot,end,employee,machine,components = min(candidates,key=lambda c:c[:6])
+                _,neg_score,start,_,_,slot,end,employee,machine,components = candidate
                 task.assigned_employee, task.machine, task.machine_slot = employee,machine,slot
                 task.planned_start, task.planned_end = start,end
                 task.status = 'READY' if order.status == task.workflow_step and not waiting else 'SCHEDULED'

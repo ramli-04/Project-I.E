@@ -10,6 +10,10 @@ from .business_views import (ProductionLotViewSet, BillingPeriodViewSet, Stateme
     FinanceInvoiceViewSet, BillingDisputeViewSet, OutboxViewSet, MessageDeliveryViewSet, CreditNoteViewSet)
 from .planning_views import (PlanningTaskViewSet, PlanningEventViewSet, AvailabilityViewSet, QualificationViewSet,
     planning_settings, workload_view, recalculate_view, planning_accounts)
+from .work_queue import work_queue
+from .payment_views import PaymentViewSet, receivables_view
+from .dashboard import dashboard_summary
+from .laboratory_profile import laboratory_profile
 
 router = DefaultRouter()
 router.register(r'planning/tasks', PlanningTaskViewSet, basename='planning-task')
@@ -29,6 +33,7 @@ router.register(r"partner-clinics", PartnerClinicViewSet, basename="partner-clin
 router.register(r"analytics/billing-catalog", MonthlyBillingCatalogViewSet, basename="billing-catalog")
 router.register(r"analytics/monthly-billing", MonthlyBillingSummaryViewSet, basename="monthly-billing")
 router.register(r'production-lots', ProductionLotViewSet, basename='production-lot')
+router.register(r'billing/payments', PaymentViewSet, basename='payment')
 router.register(r'billing/periods', BillingPeriodViewSet, basename='billing-period')
 router.register(r'billing/statement-lines', StatementLineViewSet, basename='statement-line')
 router.register(r'billing/invoices', FinanceInvoiceViewSet, basename='finance-invoice')
@@ -40,6 +45,10 @@ router.register(r'analytics/monthly-statements', MonthlyStatementCatalogViewSet,
 router.register(r'analytics/monthly-finances', MonthlyFinancialCatalogViewSet, basename='monthly-financial-catalog')
 
 urlpatterns = [
+    path('laboratory-profile/', laboratory_profile, name='laboratory-profile'),
+    path('dashboard/summary/', dashboard_summary, name='dashboard-summary'),
+    path('billing/receivables/', receivables_view, name='receivables'),
+    path('work-queue/', work_queue, name='work-queue'),
     path('planning/accounts/', planning_accounts, name='planning-accounts'),
     path('planning/calendar/', PlanningTaskViewSet.as_view({'get':'list'}), name='planning-calendar'),
     path('planning/workload/', workload_view, name='planning-workload'),

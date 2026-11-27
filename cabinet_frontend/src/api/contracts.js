@@ -1,4 +1,5 @@
 import { errorMessage } from './messages.js';
+import { cents, decimal } from '../paymentHelpers.js';
 
 export function rowsOf(data) {
   if (Array.isArray(data)) return data;
@@ -27,7 +28,25 @@ export function errorText(error) {
   return errorMessage(error);
 }
 
-export const money = value => value == null ? 'Devis laboratoire requis' : `${Number(value).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} MAD`;
+const moneyFormat = new Intl.NumberFormat('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+export function money(value) {
+  if (value == null) return 'Devis laboratoire requis';
+  if (typeof value === 'number') return Number.isFinite(value) ? moneyFormat.format(value) + ' MAD' : 'Montant indisponible';
+  const match = String(value).trim().match(/^([+-]?)(\d+)(?:\.(\d*))?$/);
+  if (!match) return String(value).trim() === '' ? '0,00 MAD' : 'Montant indisponible';
+  const fraction = match[3] || '';
+  let amount = BigInt(match[2]) * 100n + BigInt(fraction.slice(0, 2).padEnd(2, '0'));
+  if (fraction[2] >= '5') amount += 1n;
+  const result = moneyFormat.formatToParts(amount / 100n).map(part => part.type === 'fraction'
+    ? String(amount % 100n).padStart(2, '0') : part.value).join('');
+  return (match[1] === '-' ? '-' : '') + result + ' MAD';
+}
+export function sumAmounts(values) {
+  return decimal(values.reduce((total, value) => {
+    const text = String(value ?? 0).trim() || '0';
+    return total + (text.startsWith('-') ? -cents(text.slice(1)) : cents(text));
+  }, 0n));
+}
 export const quantityText = value => value == null || value === '' ? '—' : Number(value).toLocaleString('fr-FR', { maximumFractionDigits: 2 });
 export const acceptsQuantity = value => /^\d*(?:[.,]\d{0,2})?$/.test(value);
 // Existing precise server values remain untouched until the user edits them.
@@ -37,11 +56,11 @@ export function workstation() {
   try { return JSON.parse(sessionStorage.getItem('demo_user') || '{}').workstation_role || ''; } catch { return ''; }
 }
 
-export function retryableRequest() {
+export function retryableRequest({ idempotencyKey } = {}) {
   let previous;
   return async (client, path, payload, config = {}) => {
     const fingerprint = JSON.stringify([path, payload]);
-    if (previous?.fingerprint !== fingerprint) previous = { fingerprint, key: crypto.randomUUID() };
+    if (previous?.fingerprint !== fingerprint) previous = { fingerprint, key: idempotencyKey || crypto.randomUUID() };
     try {
       const response = await client.post(path, payload, { ...config, headers: { ...config.headers, 'Idempotency-Key': previous.key } });
       previous = undefined;

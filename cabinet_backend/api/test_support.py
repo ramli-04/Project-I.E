@@ -37,7 +37,7 @@ class WorkflowFixtures:
         checks = ['deformation', 'bubbles', 'limits', 'occlusion', 'hygiene'] if stage == 'PHYSICAL' else ['margins', 'occlusion', 'space', 'scan_quality']
         self.workflow_command(order, 'inspection', {'stage': stage, 'checks': dict.fromkeys(checks, True)})
 
-    def deliver_case(self, order, *, route='CFAO', pin=None, thermal_treatment='AUCUN'):
+    def deliver_case(self, order, *, route='CFAO', pin=None, thermal_treatment='AUCUN', stop_at='LIVRE'):
         pin = pin or getattr(order, '_new_delivery_pin', None)
         self.assertIsNotNone(pin, 'Fixture must retain the case creation PIN')
         if not order.accepted:
@@ -47,7 +47,7 @@ class WorkflowFixtures:
         visited = [order.status]
         for _ in range(35):
             stage = order.status
-            if stage == 'LIVRE':
+            if stage == stop_at:
                 return visited
             data = {}
             if stage == 'ANALYSE_DEMANDE':
@@ -76,4 +76,4 @@ class WorkflowFixtures:
             else:
                 self.workflow_command(order, 'advance', data)
             visited.append(order.status)
-        self.fail('Fixture did not reach delivery within the workflow bound')
+        self.fail(f'Fixture did not reach {stop_at} within the workflow bound')

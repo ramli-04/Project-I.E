@@ -1,17 +1,5 @@
 // Technical codes stay unchanged on the wire; users see French labels.
-export const statusLabels = {
-  DEMANDE_RECUE: 'Demande reçue', ANALYSE_DEMANDE: 'Analyse de la demande',
-  ATTENTE_RAMASSAGE: 'Ramassage à organiser', EN_ROUTE_LABO: 'En route vers le laboratoire',
-  A_CONFIRMER: 'Réception au laboratoire', CONTROLE_DOSSIER: 'Contrôle du dossier et des empreintes',
-  COULEE_PLATRE: 'Coulée du plâtre', SCAN_LABO: 'Scan laboratoire', CONTROLE_MODELE: 'Contrôle modèle et scan',
-  PLANIFICATION: 'Planification', SALLE_CAO: 'Conception numérique / CAO', VALIDATION_CAO: 'Validation du design par le dentiste',
-  PREPARATION_CNC: 'Préparation FAO', USINAGE_CNC: 'Usinage CNC', TRAITEMENT_THERMIQUE: 'Traitement thermique',
-  FRITTAGE_9H: 'Frittage', PREPARATION_3D: 'Préparation 3D', IMPRESSION_3D: 'Impression 3D',
-  LAVAGE_SECHAGE: 'Lavage et séchage', POST_POLYMERISATION: 'Post-polymérisation', MODELE_TRAVAIL: 'Modèle de travail',
-  MODELAGE: 'Modelage', FABRICATION_MANUELLE: 'Fabrication conventionnelle', FINITION: 'Finition',
-  CONTROLE_QUALITE: 'Contrôle qualité final', CONDITIONNEMENT: 'Conditionnement', PRET_EXPEDITION: 'Prêt pour expédition',
-  EN_ROUTE_CABINET: 'En route vers le cabinet', LIVRE: 'Livré', ESSAYAGE: 'Essayage clinique', CLOTURE: 'Essayage validé',
-  RETOUR_DEMANDE: 'Retour demandé', A_REFAIRE: 'À refaire', RECOULER: 'Recouler', RESCANNER: 'Rescanner',
+const protocolLabels = {
   PENDING: 'En attente', APPROVED: 'Approuvé', CHANGES_REQUESTED: 'Corrections demandées',
   PHYSICAL: 'Empreinte physique', DIGITAL: 'Fichier numérique', MODEL: 'Modèle et scan', QUALITY: 'Qualité',
   USAGE: 'Consommation', REWORK_LOSS: 'Perte de reprise', RESTOCK: 'Réapprovisionnement', REVERSAL: 'Correction',
@@ -22,9 +10,31 @@ export const statusLabels = {
   CALENDAR: 'Calcul du calendrier', INVOICE: 'Facture', CREDIT: 'Avoir', CACHE: 'Actualisation du cache',
   CATALOG: 'Actualisation des états', PLANNING: 'Planification',
 };
-export const labelFor = value => statusLabels[value] || value;
+export const labelFor = value => protocolLabels[value] || value;
+export const caseStatusLabel = order => order?.current_step?.label || order?.status_label
+  || order?.workflow_steps?.find(step => step.key === order.status)?.label || 'Étape non renseignée';
 
 const translations = new Map([
+  ['ICE must contain exactly 15 digits.', 'L\u2019ICE doit contenir exactement 15 chiffres. Ce champ peut rester vide.'],
+  ['Enter a valid email address.', 'Saisissez une adresse e-mail valide.'],
+  ["Payments require a positive cent-precise amount.", "Saisissez un montant positif avec au plus deux décimales."],
+  ["Reference is required for this payment method.", "La référence est obligatoire pour ce moyen de paiement."],
+  ["An LCN maturity date is required.", "Renseignez la date d’échéance de la LCN."],
+  ["Choose an invoice from this laboratory.", "Choisissez une facture de ce laboratoire."],
+  ["Choose a clinic from this laboratory.", "Choisissez un cabinet de ce laboratoire."],
+  ["Choose distinct invoices for the payment.", "Chaque facture ne peut figurer qu’une fois dans la répartition."],
+  ["Payment allocations must equal the payment amount.", "Le total réparti doit correspondre exactement au montant encaissé."],
+  ["Allocate only invoices belonging to this clinic.", "Affectez le paiement uniquement aux factures de ce cabinet."],
+  ["Payment allocation exceeds the invoice balance.", "Le montant affecté dépasse le solde restant de la facture."],
+  ["Payment idempotency key belongs to a different submission.", "Cette demande correspond à un autre encaissement. Actualisez avant de réessayer."],
+  ["Payment has already been reversed.", "Cet encaissement a déjà été annulé."],
+  ["Only cheque or LCN payments can be marked unpaid.", "Seuls un chèque ou une LCN peuvent être signalés impayés."],
+  ["Choose a payment reversal reason.", "Choisissez un motif d’annulation de l’encaissement."],
+  ["Invalid payment payload.", "Vérifiez les informations de l’encaissement."],
+  ["Payment terms must be between 0 and 120 days.", "Le délai de paiement doit être compris entre 0 et 120 jours."],
+  ["Choose a payment method.", "Choisissez un moyen de paiement."],
+  ["Choose a valid payment date.", "Choisissez une date de paiement ou d’échéance valide."],
+  ['This clinic does not belong to your account.', 'Ce cabinet n’est pas associé à votre compte.'],
   ['QR code belongs to a different laboratory or case.', 'Ce code QR appartient à un autre laboratoire ou dossier.'],
   ['Your role cannot perform this command.', 'Votre rôle ne permet pas cette action.'],
   ['Your workstation cannot perform this transition.', 'Votre poste ne permet pas de valider cette étape.'],
@@ -89,6 +99,9 @@ const translations = new Map([
   ['Each measured loss requires a usage UUID and decimal quantity.', 'Chaque perte doit référencer une consommation et une quantité décimale.'],
   ['Awaiting dentist design validation', 'En attente de validation du design par le dentiste'],
   ['Complete the analysis checkpoint.', 'Validez l’analyse de la demande avant de terminer cette étape.'],
+  ['Inspection advance must be a boolean.', 'L’option de validation et de passage à l’étape suivante doit être un booléen.'],
+  ['Your workstation cannot validate and advance this inspection checkpoint.', 'Votre poste ne peut pas valider et faire avancer ce contrôle. Demandez au poste responsable ou au responsable du laboratoire.'],
+  ['Only an unaccepted new request can be accepted and advanced.', 'Seule une nouvelle demande non encore acceptée peut être acceptée et envoyée à l’analyse. Actualisez le dossier.'],
   ['A failed inspection or gap requires photographic evidence.', 'Un contrôle non conforme ou un écart nécessite une photo de preuve.'],
   ['Invalid or expired QR code.', 'Code QR invalide ou expiré. Scannez à nouveau l’étiquette de ce dossier.'],
   ['QR code does not match this case.', 'Ce code QR ne correspond pas à ce dossier.'],
@@ -123,7 +136,7 @@ export function frenchMessage(value, fallback = 'Action impossible. Vérifiez le
   return frenchWords.test(text) ? text : fallback;
 }
 
-const fieldLabels = { detail: '', non_field_errors: '', status: 'Étape', notes: 'Motif', pin: 'PIN', qr_token: 'Code QR',
+const fieldLabels = { legal_name: 'Dénomination légale', address: 'Adresse du laboratoire', city: 'Ville du laboratoire', phone: 'Téléphone du laboratoire', ice: 'ICE', identifiant_fiscal: 'Identifiant fiscal', registre_commerce: 'Registre du commerce', patente: 'Patente', clinic: 'Cabinet', method: 'Moyen de paiement', amount: 'Montant', received_on: 'Date de réception', due_on: 'Échéance', bank: 'Banque', reference: 'Référence', allocations: 'Répartition', invoice: 'Facture', payment_terms_days: 'Délai de paiement', detail: '', non_field_errors: '', status: 'Étape', notes: 'Motif', pin: 'PIN', qr_token: 'Code QR',
   file: 'Fichier', code: 'Code', quantity_changed: 'Quantité', inventory_item: 'Consommable', prescription: 'Dossier',
   delivery_date: 'Livraison prévue', production_method: 'Méthode de fabrication', analysis_validated: 'Analyse',
   reception_validated: 'Réception', quality_validated: 'Qualité', employee: 'Technicien', machine: 'Machine',

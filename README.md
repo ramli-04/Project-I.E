@@ -8,6 +8,8 @@ The project was previously called **Cabinet 2.0**. Existing directory names and 
 
 > **Development status:** the isolated Docker demo runs the real Django/PostgreSQL workflow, tenant authentication, background tasks, technician/machine phases and monthly statements. Guided case MY-TEST-001 reached clinical closure and its statement on 21 November 2026. Device adapters and production deployment validation remain pending. Current verification evidence is in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
 
+The [BPMN coverage matrix](docs/BPMN_COVERAGE.md) maps every requested process element and gateway outcome to code and tests. It records the completed demo's limits and the product decisions still needed before implementing missing behavior.
+
 ## Present the complete demo
 
 Follow [DEMO_GUIDE.md](DEMO_GUIDE.md) for setup, credentials, a short presentation of the completed case, and a complete fresh-case walkthrough from prescription to delivery, fitting and billing. The `demo/` folder provides a synthetic STL and a simulation-only signed-QR helper. Start the real demo with `docker compose -f compose.demo.yml up -d --build`, then open **http://localhost:18080**.
@@ -46,18 +48,19 @@ Open **[http://localhost:5174/static/](http://localhost:5174/static/)**, or the 
 
 | Area | Current frontend functionality |
 | --- | --- |
-| Laboratory workspace | Light gray and teal design, interactive FDI tooth overview, fabrication queue, workflow charts and responsive navigation |
-| Dentist portal | Tooth-level function, form, shade and material; verified clinic selection; disinfection confirmation; actual STL upload with upload-retry recovery |
-| Fabrication | Server-defined workflow steps, physical/digital/model/quality inspections, private evidence, design approval, pause/resume and documented rework |
-| Courier portal | Signed QR pickup, laboratory deposit and checkout; delivery confirmation using the entered four-digit PIN |
+| Laboratory workspace | Personal **À faire** queue, one shared case workspace, server-defined stages, alerts on the landing page and responsive navigation |
+| Dentist portal | **Mes commandes** with stage progress and expected delivery date; teeth selected on an FDI chart with per-tooth function, form, shade and material (optional copy to all teeth); verified clinic selection; disinfection confirmation; actual STL upload with upload-retry recovery; Fonction / Forme / Teinte (VITA) dropdowns with "Autre…"; QR label download after submission |
+| Fabrication | Shared workflow specification and command handlers; physical/digital/model/quality inspections, private evidence, design approval, pause/resume and documented rework; design upload and production-lot creation inside the case action; complete delivery note (contents, dates, lot, signatures) |
+| Courier portal | Signed QR pickup, laboratory deposit and checkout; delivery confirmation using the entered four-digit PIN; the QR can be imported from a label image (decoded offline in the browser) |
 | Stocks et lots | **Personnel**, **Matériaux** and **Stock** tabs; material catalogue, stock balances, usage/restock movements, compensating corrections and linked production lots |
-| Finance | Delivered-month statements, contested/excluded lines, monthly closing, invoices, credits, dispute resolution and PDF downloads |
-| Operations | Durable task retry, message-delivery reconciliation and catalogue refresh information |
+| Finance | Delivery-month statements, invoices, credits, immutable payments and reversals, receivables aging and exact decimal MAD totals; **Commandes livrées** table (work, service, amount, status, total) with the current month preselected |
+| Management | Live operations/finance dashboard, provisional capacity preview and laboratory identity on new documents |
+| Diagnostic technique | Under Configuration (manager): failed or pending background jobs by default, durable retry and message-delivery reconciliation |
 | Administration | Password-based accounts, laboratory assignments, workstation roles and session-expiry handling |
 
-The site and browser tab share the teal tooth logo. Animations include tooth reveals, page transitions, chart growth and illustration rotation, with support for `prefers-reduced-motion`.
+The site and browser tab share the teal tooth logo. Animations include tooth reveals and page transitions, with support for `prefers-reduced-motion`.
 
-Quantity entry and display use **at most two decimal places**. Existing database precision is retained until a value is edited. Dental illustrations summarize associated orders; they do not generate clinical diagnoses.
+Quantity entry and display use **at most two decimal places**. Existing database precision is retained until a value is edited. The FDI tooth chart only selects teeth for a prescription; it does not generate clinical diagnoses.
 
 ### Business rules
 
@@ -66,6 +69,23 @@ Quantity entry and display use **at most two decimal places**. Existing database
 - **J+1:** requires a **manual laboratory urgency quote** before production.
 - **Monthly statements:** group cases delivered during the month using the **Africa/Casablanca** calendar.
 - **External email/WhatsApp delivery:** disabled by default until explicitly configured.
+
+## v1.0 scope and v2 roadmap
+
+The local **Gestion Labo v1.0** implementation includes the streamlined role-specific workspace, French contextual reason choices and top-of-screen feedback, advisory capacity, immutable payment records and reversals, receivables aging, the manager/accounting dashboard, and laboratory identity on new PDFs. Capacity at order entry is provisional and compares existing routes; it neither reserves a slot nor chooses the final route.
+
+The light simulator runs separately in `cabinet-sim`. Its three four-week reports are still being validated; see [the clock audit](docs/SIMULATION_CLOCK_AUDIT.md) and [test results](docs/TEST_RESULTS.md). Synthetic workloads are assumptions, not measurements of a real laboratory.
+
+| Deferred work | Boundary of v1.0 |
+| --- | --- |
+| D5 — explicit piece inspection (G7) | Manufacturing rework is available; a separate G7 inspection record is deferred. |
+| D6 — a new linked remake case | Rework keeps immutable evidence on the same case and increments the production attempt. |
+| D7 — capabilities and BPMN lane alignment | Existing workstation ownership and permissions are preserved. |
+| D8 — full simulator | UI, staffing what-ifs, device/disconnect scenarios and calibration belong after the defense. |
+| Device integration | CNC, furnace, scanner, printer and CAD phases remain human acknowledgements. |
+| Deployment and external delivery | No public hosting or live email/WhatsApp validation; deployment needs explicit authorization. |
+
+Start with the [French user guide](docs/GUIDE_UTILISATEUR.md) for each role. The fresh additive V1 case preparation and verification-only aging examples are described in [the demo guide](DEMO_GUIDE.md). A source checkout does not transfer local data, and these uncommitted changes are not yet available from the contributor branch.
 
 ## Technology stack
 
@@ -202,7 +222,7 @@ docker compose stop celery_worker celery_beat redis
 
 ## Production planning and manual progress
 
-The laboratory workspace includes **Planning** with day, week, month, employee and order calendars, a Gantt view with dependencies and actual timings, workload, filters, history and supervisor assignment forms. **Progression de fabrication** in each order starts, pauses, resumes, blocks or completes its current production task through the existing idempotent case-command endpoint.
+The laboratory workspace includes **Planning** with day, week, month, employee and order calendars, a Gantt view with dependencies and actual timings, workload, filters, history and supervisor assignment forms. The personal **À faire** queue, orders and planning open the same case workspace. Its current action starts or completes the current task; **Signaler un problème** contains pause/block/rework controls and **Dossier** contains documents and history. All writes use the existing idempotent case-command endpoint. Workflow labels, ownership and restart choices derive from the shared backend specification, with [generated route diagrams](docs/WORKFLOW.md) and compatibility tests.
 
 Accepted orders generate tasks from their applicable workflow. The deterministic scheduler enforces employee roles, mandatory qualifications and expiry, working hours, absences, dependencies and equipment capacity before ranking eligible candidates. Supervisors can configure durations and weights, manage availability and qualifications, link personnel to laboratory login accounts, and lock assignments. Started, completed and locked work is preserved; conflicts and delivery risks are reported.
 
