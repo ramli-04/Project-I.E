@@ -58,3 +58,4 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 /test-results/
+/AGENT_PROMPT_UX_STREAMLINING.md

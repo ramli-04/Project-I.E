@@ -372,49 +372,6 @@ Répéter la démonstration du paiement sur une **nouvelle facture du projet de 
 
 Le taux de reprises divise les preuves de reprise des30derniers jours par les dossiers livrés dans cette fenêtre ; il peut dépasser100% si plusieurs tentatives existent. Sans livraison, le taux est indéfini et affiché « — », avec les deux nombres.
 
-## Simulation isolée : trois laboratoires, quatre semaines
-
-Cette exécution est distincte de la présentation : elle utilise uniquement le projet **cabinet-sim**, API **18002**, avec ses propres volumes PostgreSQL/Redis/fichiers. Elle refuse le schéma de présentation **simlab**, le projet principal et le projet de vérification. Aucun identifiant de la démonstration n'est requis. Les identifiants synthétiques sont générés sans être imprimés.
-
-Prérequis : Docker Desktop et, pour assembler le rapport Markdown final, Python 3 sur le PC. Depuis la racine, le script ci-dessous conserve les JSON dans un **nouveau dossier temporaire**. Il ne remplace pas les preuves de cette version. Chaque scénario utilise un nouveau SIM_RUN ; ne jamais relancer une commande de simulation dans un jeu partiellement rempli.
-
-```powershell
-$simBatch = Get-Date -Format 'yyyyMMdd-HHmmss'
-$simOutput = Join-Path $env:TEMP "gestion-labo-simulation-$simBatch"
-New-Item -ItemType Directory -Path $simOutput -ErrorAction Stop | Out-Null
-try {
-    foreach ($simScenario in @('normal', 'ramadan', 'mixed')) {
-        $env:SIM_RUN = "$simBatch-$simScenario"
-        docker compose -p cabinet-sim -f compose.sim.yml up -d --build
-        if ($LASTEXITCODE -ne 0) { throw "Construction impossible : $simScenario" }
-        docker compose -p cabinet-sim -f compose.sim.yml exec -T backend python manage.py simulate_lab --scenario $simScenario --seed 20261209 --days 28 --grand-daily 12 --output /demo/simulation-reports/report.json
-        if ($LASTEXITCODE -ne 0) { throw "Simulation interrompue : $simScenario ; volumes conserves" }
-        docker compose -p cabinet-sim -f compose.sim.yml cp backend:/demo/simulation-reports/report.json "$simOutput/$simScenario.json"
-        if ($LASTEXITCODE -ne 0) { throw "Copie des metriques impossible : $simScenario" }
-        docker compose -p cabinet-sim -f compose.sim.yml stop
-    }
-    python -m cabinet_backend.api.simulation.report "$simOutput/normal.json" "$simOutput/ramadan.json" "$simOutput/mixed.json" --output "$simOutput/SIMULATION_REPORT.md"
-    if ($LASTEXITCODE -ne 0) { throw 'Assemblage du rapport refuse' }
-    Write-Output "Rapport et metriques : $simOutput"
-} finally {
-    docker compose -p cabinet-sim -f compose.sim.yml stop
-    Remove-Item Env:SIM_RUN -ErrorAction SilentlyContinue
-}
-```
-
-Le temps réel dépend du PC et du nombre de dossiers ; ne pas lancer ce calcul pendant une présentation courte. Les journées virtuelles sont affichées au fil de l'exécution. GRAND est limité ici à **12 dossiers/jour**, contre 60 nominaux, pour borner le calcul ; PETIT reste à 8 et MOYEN à 20 (30 dans le scénario mixte). Les techniciens de conception/fabrication restent 2/5/10, auxquels s'ajoutent une personne de réception et une de qualité par laboratoire : **4/7/12 personnes planifiées**.
-
-Pour un contrôle rapide dans un **autre nouveau SIM_RUN**, remplacer les options de la commande par `--days 2 --tiny` ; ce probe ne constitue pas une preuve mensuelle et le générateur de rapport le refuse. Une erreur arrête l'exécution. Conserver son journal et ses volumes, corriger la cause, puis choisir un nouveau SIM_RUN. Ne pas effacer, réinitialiser ou réensemencer un ancien jeu.
-
-Arrêt seul, sans suppression de données :
-
-```powershell
-docker compose -p cabinet-sim -f compose.sim.yml stop
-```
-
-Les PDF et les contrôles financiers d'isolation sont créés après la fenêtre de charge, dans les seuls laboratoires du simulateur. Aucun relevé de la présentation n'est clôturé. Les limites de temps sont décrites dans [l'audit des horloges](docs/SIMULATION_CLOCK_AUDIT.md).
-
-
 ## Identité du laboratoire sur les nouveaux documents
 
 1. Se connecter comme **Demo Manager**, ouvrir **Configuration**, puis déplier **Identité du laboratoire**. Le clavier permet d'atteindre ce titre et de l'ouvrir avec Entrée.
