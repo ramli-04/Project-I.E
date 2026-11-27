@@ -9,7 +9,7 @@ from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
 from django_tenants.utils import schema_context
 from redis.exceptions import RedisError
-
+from .workflow_spec import Action
 from .models import Prescription, PrescriptionHistory
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def capture_previous_status(sender, instance, raw, using, **kwargs):
     if not instance._state.adding:
         # Prescription.save() opens the transaction before pre_save is emitted.
         instance._previous_status = (
-            sender.objects.using(using).select_for_update()
+            sender.objects.using(using).select_for_update(no_key=True)
             .filter(pk=instance.pk).values_list('status', flat=True).first()
         )
     instance._previous_invoice = None
@@ -98,7 +98,7 @@ def record_prescription_change(sender, instance, created, raw, using, update_fie
     WorkflowEvent.objects.using(using).create(
         prescription_id=instance.pk, kind='CREATED' if created else 'UPDATED', changed_by=changed_by,
         payload={'fields': sorted(update_fields) if update_fields else ['source'], 'notes': notes,
-                 'state_version': instance.state_version, 'action': _workflow_metadata.get().get('action', 'SAVE')},
+                 'state_version': instance.state_version, 'action': _workflow_metadata.get().get('action', Action.SAVE)},
     )
     # Also refresh after non-status writes: billing, pause, acceptance, etc.
     invalidate_active_orders_after_commit(using)

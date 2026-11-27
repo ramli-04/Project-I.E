@@ -1,12 +1,16 @@
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from decimal import Decimal
 from importlib import import_module
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 import psycopg2
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import DatabaseError, connection, transaction
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TransactionTestCase, override_settings
+from django.utils import timezone
 from django.test.utils import CaptureQueriesContext
 from django_tenants.test.cases import TenantTestCase
 from django_tenants.utils import schema_context
@@ -14,17 +18,24 @@ from rest_framework.test import APIClient
 
 from customers.models import Client, PlatformAccount
 from .analytics import PIPELINE, refresh_billing_catalog
-from .models import AnalyticsRefreshState, MonthlyBillingCatalog, MonthlyBillingSummary, PartnerClinic, Prescription
+from .models import AnalyticsRefreshState, MonthlyBillingCatalog, MonthlyBillingSummary, PartnerClinic, Prescription, BillingPeriod
 from .tasks import refresh_monthly_billing_catalog_task, refresh_tenant_billing_catalog_task
+from .test_support import WorkflowFixtures
+from .billing import close_period
 
 
-class BillingAnalyticsTests(TenantTestCase):
+@override_settings(OUTBOX_PUBLISH_ON_COMMIT=False, EXTERNAL_DELIVERY_ENABLED=False)
+class BillingAnalyticsTests(WorkflowFixtures, TenantTestCase):
     @classmethod
     def setup_tenant(cls, tenant):
         tenant.name = 'Analytics laboratory'
 
     def setUp(self):
+        super().setUp()
         connection.set_tenant(self.tenant)
+        self.clock = patch('django.utils.timezone.now', return_value=datetime(2026, 11, 15, 12, tzinfo=dt_timezone.utc))
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
         with schema_context('public'):
             self.manager = get_user_model().objects.create_user(username='analytics-manager', is_superuser=True)
         self.client = APIClient(HTTP_HOST=self.get_test_tenant_domain())
@@ -32,12 +43,27 @@ class BillingAnalyticsTests(TenantTestCase):
         self.clinic = PartnerClinic.objects.create(name='Clinic A', pickup_address='12 Main Street', contact_phone='123')
 
     def order(self, **changes):
-        payload = dict(patient_ref='ANALYTICS', dentist_name='Dentist', tooth_number=11, shade='A2', material='Zircone', disinfected=True, total_price=500, partner_clinic=self.clinic)
-        return Prescription.objects.create(**{**payload, **changes})
+        payload = dict(patient_ref='ANALYTICS', dentist_name='Dentist', tooth_number=11, shade='A2', material='Zircone', disinfected=True, total_price=500, partner_clinic=self.clinic, accepted=True, impression_type='NUMERIQUE')
+        payload.update(changes)
+        payload.setdefault('base_amount', payload['total_price'])
+        # Historical native cases retain their legacy intake format; their
+        # delivery and invoicing still pass through current domain commands.
+        with patch('django.utils.timezone.now', return_value=datetime(2026, 1, 1, 12, tzinfo=dt_timezone.utc)):
+            return Prescription.objects.create(**payload)
 
     def invoice(self, order):
-        order.billing_stage = 'FACTURE'
-        order.save(update_fields=['billing_stage'])
+        issued_at = timezone.now()
+        delivery = timezone.localtime(issued_at).replace(day=1)
+        # Separate delivery periods let independent invoices share an issue
+        # month without attempting delivery into an already closed statement.
+        delivery = (delivery - timedelta(days=1)).replace(day=1)
+        while BillingPeriod.objects.filter(clinic_id=order.partner_clinic_id, month=delivery.date()).exists():
+            delivery = (delivery - timedelta(days=1)).replace(day=1)
+        delivery = delivery.replace(day=10, hour=12)
+        with patch('django.utils.timezone.now', return_value=delivery):
+            self.deliver_case(order)
+        close_period(order.statement_line.period_id, 'test:accountant')
+        order.refresh_from_db()
         return order
 
     def refresh(self):
@@ -63,7 +89,7 @@ class BillingAnalyticsTests(TenantTestCase):
                 with self.assertRaises(ValidationError):
                     order.save()
 
-    def test_invoice_uses_persisted_price_when_update_fields_excludes_price(self):
+    def test_monthly_closing_uses_persisted_price_not_unsaved_instance_value(self):
         order = self.order()
         order.total_price = 999
         self.invoice(order)
@@ -76,43 +102,37 @@ class BillingAnalyticsTests(TenantTestCase):
         order.status = 'ANALYSE_DEMANDE'
         order.save(update_fields=['status'])
         order.status = 'A_CONFIRMER'
-        order.save(update_fields=['status'])
+        order.analysis_validated = True
+        order.save(update_fields=['status', 'analysis_validated'])
         self.invoice(order)
-        self.invoice(self.order(total_price=700))
-        self.invoice(self.order(partner_clinic=None, total_price=100))
+        second = self.invoice(self.order(total_price=700))
+        self.order(partner_clinic=None, total_price=100)
         self.order(total_price=900)
         self.assertEqual(self.refresh()['status'], 'refreshed')
         self.assertEqual(MonthlyBillingCatalog.objects.count(), 4)
         detail = MonthlyBillingCatalog.objects.get(pk=order.pk)
-        self.assertEqual(detail.audit_event_count, 3)
-        self.assertEqual(detail.status_transition_count, 2)
+        self.assertEqual(detail.audit_event_count, order.audit_history.count())
+        self.assertEqual(detail.status_transition_count, order.audit_history.exclude(previous_status='').count())
         summary = MonthlyBillingSummary.objects.get(partner_clinic_id=self.clinic.pk)
         self.assertEqual(summary.invoice_count, 2)
         self.assertEqual(summary.invoiced_total, Decimal('1200'))
-        self.assertEqual(summary.status_transition_count, 2)
-        self.assertEqual(MonthlyBillingSummary.objects.get(partner_clinic_id__isnull=True).invoiced_total, Decimal('100'))
+        self.assertEqual(summary.status_transition_count, sum(
+            case.audit_history.exclude(previous_status='').count() for case in (order, second)))
+        self.assertFalse(MonthlyBillingSummary.objects.filter(partner_clinic_id__isnull=True).exists())
         self.assertIsNotNone(AnalyticsRefreshState.objects.get(pk=PIPELINE).last_success_at)
 
     def test_invoice_month_uses_casablanca_calendar(self):
-        order = self.order()
-        with patch('api.models.timezone.now', return_value=datetime(2026, 11, 30, 23, 30, tzinfo=dt_timezone.utc)):
-            self.invoice(order)
-        self.refresh()
-        self.assertEqual(MonthlyBillingCatalog.objects.get(pk=order.pk).billing_month.isoformat(), '2026-12-01')
-
-    def test_legacy_undated_invoices_are_flagged_not_assigned_invented_dates(self):
-        order = self.order()
-        # Simulate a record that pre-dates the timestamp migration.
-        with connection.cursor() as cursor:
-            cursor.execute("UPDATE api_prescription SET billing_stage = 'FACTURE' WHERE id = %s", [order.pk])
-        order.refresh_from_db()
-        order.technical_notes = 'Legacy notes'
-        order.save(update_fields=['technical_notes'])
-        self.assertIsNone(order.invoiced_at)
-        self.refresh()
-        self.assertTrue(MonthlyBillingCatalog.objects.get(pk=order.pk).legacy_invoice_without_date)
-        self.assertEqual(MonthlyBillingSummary.objects.count(), 0)
-        self.assertEqual(AnalyticsRefreshState.objects.get(pk=PIPELINE).undated_invoice_count, 1)
+        # Installed tzdata, not a hard-coded UTC+1 assumption, defines midnight.
+        boundary = datetime(2026, 12, 1, tzinfo=ZoneInfo('Africa/Casablanca'))
+        for offset, month in [(-30, '2026-11-01'), (30, '2026-12-01')]:
+            with self.subTest(month=month):
+                instant = (boundary + timedelta(minutes=offset)).astimezone(dt_timezone.utc)
+                with patch('django.utils.timezone.now', return_value=instant):
+                    order = self.invoice(self.order())
+                self.assertEqual(order.invoiced_at, instant)
+                self.assertEqual(order.statement_line.period.invoice.issued_at, instant)
+                self.refresh()
+                self.assertEqual(MonthlyBillingCatalog.objects.get(pk=order.pk).billing_month.isoformat(), month)
 
     def test_endpoint_uses_only_catalog_and_metadata_with_pagination_and_filters(self):
         order = self.invoice(self.order())
@@ -217,3 +237,33 @@ class BillingAnalyticsTests(TenantTestCase):
             views = dict(cursor.fetchall())
         self.assertTrue(views['monthly_billing_catalog'])
         self.assertTrue(views['monthly_billing_summary'])
+
+
+@override_settings(OUTBOX_PUBLISH_ON_COMMIT=False, EXTERNAL_DELIVERY_ENABLED=False)
+class LegacyBillingMigrationTests(TransactionTestCase):
+    def test_legacy_undated_invoices_are_flagged_not_assigned_invented_dates(self):
+        connection.set_schema_to_public()
+        tenant = Client.objects.create(schema_name='legacy_billing_migration', name='Disposable legacy migration')
+        try:
+            with schema_context(tenant.schema_name):
+                executor = MigrationExecutor(connection)
+                latest = executor.loader.graph.leaf_nodes()
+                historical = [('api', '0015_prescription_history')]
+                executor.migrate(historical)
+                old_apps = executor.loader.project_state(historical).apps
+                OldPrescription = old_apps.get_model('api', 'Prescription')
+                old = OldPrescription.objects.create(patient_ref='LEGACY-UNDATED', dentist_name='Legacy clinic',
+                    tooth_number='11', shade='A2', material='Zircone', disinfected=True,
+                    total_price=500, billing_stage='FACTURE')
+                MigrationExecutor(connection).migrate(latest)
+                order = Prescription.objects.get(pk=old.pk)
+                self.assertIsNone(order.invoiced_at)
+                order.technical_notes = 'Legacy notes'
+                order.save(update_fields=['technical_notes'])
+                refresh_billing_catalog(tenant.schema_name)
+                self.assertTrue(MonthlyBillingCatalog.objects.get(pk=order.pk).legacy_invoice_without_date)
+                self.assertEqual(MonthlyBillingSummary.objects.count(), 0)
+                self.assertEqual(AnalyticsRefreshState.objects.get(pk=PIPELINE).undated_invoice_count, 1)
+        finally:
+            connection.set_schema_to_public()
+            tenant.delete(force_drop=True)

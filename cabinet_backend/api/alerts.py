@@ -1,6 +1,15 @@
 from datetime import timedelta
+from decimal import Decimal
 from django.utils import timezone
 from .models import Equipment, StaffMember, StockItem, Inventory, MonthlyStockLossCatalog
+
+
+def _qty(value):
+    """Human quantity: 4.000000 -> 4, 350.500000 -> 350.5 (never scientific notation)."""
+    if isinstance(value, Decimal):
+        text = format(value.normalize(), 'f')
+        return text.rstrip('0').rstrip('.') if '.' in text else text
+    return f'{value:g}'
 
 
 def laboratory_alerts(today=None):
@@ -27,14 +36,14 @@ def laboratory_alerts(today=None):
 
     for item in StockItem.objects.all():
         if item.quantity <= item.minimum_quantity:
-            add('stock', 'stock', item, f'Votre stock de « {item.name} » est au seuil d’alerte ou en dessous : {item.quantity:g} {item.unit} restant(s), seuil {item.minimum_quantity:g} {item.unit}.')
+            add('stock', 'stock', item, f'Votre stock de « {item.name} » est au seuil d’alerte ou en dessous : {_qty(item.quantity)} {item.unit} restant(s), seuil {_qty(item.minimum_quantity)} {item.unit}.')
         if item.expiry_date and item.expiry_date < today:
             add('expiry', 'stock', item, f'Votre stock de « {item.name} » est périmé depuis le {item.expiry_date:%d/%m/%Y}.', item.expiry_date)
 
     for item in Inventory.objects.all():
         if item.is_low_stock:
             add('stock', 'inventory', item,
-                f'Le stock de matière « {item.material_name} » est au seuil d’alerte ou en dessous : {item.quantity:g} {item.unit} restant(s), seuil {item.alert_threshold:g} {item.unit}.',
+                f'Le stock de matière « {item.material_name} » est au seuil d’alerte ou en dessous : {_qty(item.quantity)} {item.unit} restant(s), seuil {_qty(item.alert_threshold)} {item.unit}.',
                 reference=item.material_name, name=item.material_name)
 
     for catalog in MonthlyStockLossCatalog.objects.filter(complete_valuation=False):
@@ -42,7 +51,7 @@ def laboratory_alerts(today=None):
             'id': f'loss-valuation-{catalog.pk}', 'type': 'loss', 'section': 'inventory',
             'resource_id': catalog.pk, 'name': catalog.inventory_item.material_name,
             'reference': catalog.inventory_item.material_name,
-            'message': f'Pertes matières de « {catalog.inventory_item.material_name} » pour {catalog.loss_month:%Y-%m} avec valorisation incomplète ({catalog.unvalued_quantity:g} {catalog.inventory_item.unit} sans coût unitaire).',
+            'message': f'Pertes matières de « {catalog.inventory_item.material_name} » pour {catalog.loss_month:%Y-%m} avec valorisation incomplète ({_qty(catalog.unvalued_quantity)} {catalog.inventory_item.unit} sans coût unitaire).',
             'due_date': None,
             'overdue': True,
         })

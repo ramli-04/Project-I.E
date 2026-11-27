@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Building2, Users, Activity, LifeBuoy, KeyRound, RefreshCw, X } from 'lucide-react';
 import platform from './api/platform';
+import { errorText } from './api/contracts';
+import { Feedback } from './IntegrationUI';
 
 const control = 'w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-sky-400';
 const roles = { ADMIN: 'Administrateur', LAB: 'Laboratoire', DENTIST: 'Dentiste', COURIER: 'Coursier' };
@@ -11,9 +13,7 @@ async function fetchAdminData() {
   const results = await Promise.all(['overview/', 'laboratories/', 'accounts/', 'logs/', 'support/'].map(url => platform.get(url)));
   return { overview: results[0].data, laboratories: results[1].data, accounts: results[2].data, logs: results[3].data, tickets: results[4].data };
 }
-function failure(err) {
-  return err.response?.data ? Object.values(err.response.data).flat().join(' ') : 'Connexion au serveur impossible.';
-}
+const failure = errorText;
 
 export default function AdminPortal() {
   const [tab, setTab] = useState('overview');
@@ -66,7 +66,7 @@ export default function AdminPortal() {
   return <div className="space-y-6"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs uppercase tracking-widest text-teal-700">Administration du projet</p><h1 className="mt-2 text-2xl font-semibold">Pilotage de la plateforme</h1><p className="mt-2 text-sm text-slate-500">Laboratoires, clients dentistes, affectations et assistance technique.</p></div><button disabled={busy} onClick={refresh} className="flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-600 disabled:opacity-50"><RefreshCw className="h-4 w-4" />Actualiser</button></div>
     <p className="rounded-xl border border-sky-400/20 bg-sky-400/5 p-3 text-xs text-teal-800">La connexion exige un mot de passe. Une modification des droits ferme les sessions du compte.</p>
     <div className="flex flex-wrap gap-2 border-b border-slate-200/80">{tabs.map(([key, label, Icon]) => <button key={key} onClick={() => setTab(key)} className={`flex items-center gap-2 border-b-2 px-3 py-3 text-sm ${tab === key ? 'border-sky-400 text-teal-700' : 'border-transparent text-slate-500'}`}><Icon className="h-4 w-4" />{label}</button>)}</div>
-    {error && <p role="alert" className="rounded-xl bg-red-400/10 p-3 text-sm text-red-700">{error}</p>}{notice && <p role="status" className="rounded-xl bg-emerald-400/10 p-3 text-sm text-emerald-700">{notice}</p>}
+    <Feedback error={error} notice={notice} />
     {password && <section aria-label="Mot de passe temporaire" className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-4"><div className="flex justify-between gap-3"><h2 className="text-sm font-medium text-amber-800">Mot de passe temporaire — {password.name}</h2><button onClick={() => setPassword(null)} aria-label="Masquer le mot de passe"><X className="h-4 w-4" /></button></div><code className="mt-3 block select-all break-all text-lg">{password.value}</code><p className="mt-2 text-xs text-slate-500">Affiché uniquement ici ; aucun envoi automatique.</p></section>}
     {!data ? !error && <p className="py-10 text-sm text-slate-500">Chargement de l’administration…</p> : <>
       {tab === 'overview' && <><div className="grid gap-4 md:grid-cols-4">{[['Laboratoires', data.laboratories.length], ['Clients dentistes', data.overview.dentist_count], ['Comptes', data.overview.account_count], ['Incidents ouverts', data.overview.open_tickets]].map(([label, value]) => <div key={label} className="rounded-2xl border border-slate-200/80 bg-white p-5"><p className="text-sm text-slate-500">{label}</p><p className="mt-3 text-3xl font-semibold text-teal-700">{value}</p></div>)}</div><div className="grid gap-4 lg:grid-cols-2">{data.overview.laboratories.map(item => <section key={item.id} className="rounded-2xl border border-slate-200/80 bg-white p-5"><h2 className="font-semibold">{item.name}</h2><p className="mt-1 text-xs text-slate-500">{item.identifier}</p><div className="mt-4 flex flex-wrap gap-5 text-sm text-slate-600"><span>{item.order_count} commande(s)</span><span>{item.paused_count} en pause</span><span>{item.account_count} compte(s) affecté(s)</span></div></section>)}</div></>}

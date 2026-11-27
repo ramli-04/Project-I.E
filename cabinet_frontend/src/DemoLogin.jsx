@@ -1,9 +1,12 @@
-﻿import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ArrowRight } from 'lucide-react';
 import platform from './api/platform';
+import { errorText } from './api/contracts';
+import { Feedback } from './IntegrationUI';
 import { useTenant } from './contexts/useTenant';
 import SidebarLogo from './SidebarLogo';
-import { DentalTooth } from './ClinicalDashboard';
+import { productVersion } from './version';
+import { DentalTooth } from './ToothPicker';
 import { previewMode } from './api/preview';
 
 const inputClass = 'mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm text-slate-900 outline-none focus:border-sky-400 focus:ring-1 focus:ring-sky-400 disabled:opacity-50';
@@ -49,7 +52,7 @@ export default function DemoLogin({ setUser }) {
       }
       sessionStorage.setItem('demo_user', JSON.stringify(user)); setUser(user);
     } catch (err) {
-      setError(err.response?.data?.detail || (portal === 'COURIER' ? err.message : 'Connexion impossible. Vérifiez votre identification, l’espace choisi et la connexion au serveur.'));
+      setError(errorText(err));
     } finally { setBusy(false); }
   }
 
@@ -61,11 +64,12 @@ export default function DemoLogin({ setUser }) {
       {needsLab && <div><label htmlFor="login-laboratory" className="block text-sm text-slate-600">Laboratoire<select id="login-laboratory" required disabled={loadingLabs || Boolean(labError)} value={laboratory} onChange={event => { setLaboratory(event.target.value); setError(''); }} className={inputClass}><option value="">{loadingLabs ? 'Chargement…' : 'Choisir un laboratoire'}</option>{laboratories.map(lab => <option key={lab.identifier} value={lab.identifier}>{lab.name}</option>)}</select></label>
         {labError ? <p role="alert" className="mt-2 text-xs text-red-700">{labError} <button type="button" onClick={() => { setLoadingLabs(true); setLabError(''); setRetry(value => value + 1); }} className="underline">Réessayer</button></p> : !loadingLabs && !laboratories.length && <p role="status" className="mt-2 text-xs text-amber-700">Aucun laboratoire disponible. Contactez l’administration.</p>}
       </div>}
-      <label htmlFor="login-name" className="block text-sm text-slate-600">{portal === 'COURIER' ? 'Nom du coursier' : 'Votre identification'}<input id="login-name" autoComplete="username" required maxLength={150} pattern=".*\S.*" value={name} onChange={event => setName(event.target.value)} placeholder={portal === 'LAB' || portal === 'COURIER' ? 'Mohamed' : portal === 'DENTIST' ? 'Dentiste 1' : 'Admin'} className={inputClass} />{portal === 'LAB' && <span className="mt-2 block text-xs text-slate-500">Exemple : sélectionnez Labo 1 et saisissez simplement Mohamed.</span>}</label>
+      <label htmlFor="login-name" className="block text-sm text-slate-600">{portal === 'COURIER' ? 'Nom du coursier' : 'Votre identification'}<input id="login-name" autoComplete="username" required maxLength={150} pattern=".*\S.*" value={name} onChange={event => setName(event.target.value)} placeholder="Identifiant de votre compte" className={inputClass} />{portal === 'LAB' && <span className="mt-2 block text-xs text-slate-500">Sélectionnez votre laboratoire et utilisez l’identifiant de votre compte.</span>}</label>
       <label htmlFor="login-password" className="block text-sm text-slate-600">Mot de passe<input id="login-password" type="password" autoComplete="current-password" required maxLength={256} value={password} onChange={event => setPassword(event.target.value)} className={inputClass} /></label>
     </fieldset>
-    {error && <p role="alert" className="rounded-xl border border-red-400/20 bg-red-400/10 p-3 text-sm text-red-700">{error}</p>}
+    <Feedback error={error || labError} />
     <button disabled={busy || (needsLab && (loadingLabs || Boolean(labError) || !laboratory))} className="flex w-full items-center justify-center gap-2 rounded-xl bg-teal-600 px-4 py-3 font-medium hover:bg-teal-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 disabled:opacity-50">{busy ? 'Connexion…' : 'Accéder à mon espace'}<ArrowRight aria-hidden="true" className="h-4 w-4" /></button></form>
     <p className="mt-6 text-xs leading-relaxed text-slate-500">Accès personnel sécurisé. Pour obtenir un compte ou réinitialiser votre mot de passe, contactez l’administration.</p>
+    <p className="mt-4 text-center text-xs font-medium text-teal-800">{productVersion}</p>
   </section></div>;
 }

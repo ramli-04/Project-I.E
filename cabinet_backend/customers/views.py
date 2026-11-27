@@ -259,6 +259,29 @@ def support(request, ticket_id=None):
     return Response([{'id': item.pk, 'name': item.account.name, 'laboratory': item.account.laboratory.name if item.account.laboratory else '', 'subject': item.subject, 'message': item.message, 'status': item.status, 'created_at': item.created_at} for item in items[:200]])
 
 
+@api_view(['POST'])
+@public_schema
+def dentist_capacity_preview(request):
+    account = current_account(request)
+    if account.role != 'DENTIST':
+        raise PermissionDenied('Accès réservé aux dentistes.')
+    if not isinstance(request.data, dict):
+        from api.capacity import capacity_preview
+        return Response(capacity_preview(None))
+    lab = Client.objects.exclude(schema_name='public').filter(
+        schema_name=request.data.get('laboratory_id'), is_active=True).first()
+    if not lab:
+        return Response({'laboratory_id': ['Choisissez un laboratoire valide.']}, status=400)
+    from django_tenants.utils import tenant_context
+    from api.models import PartnerClinic
+    from api.capacity import capacity_preview
+    with tenant_context(lab):
+        # Do not disclose even dates for a laboratory without a clinic link.
+        if not PartnerClinic.objects.filter(platform_dentist=account).exists():
+            raise PermissionDenied('This clinic does not belong to your account.')
+        return Response(capacity_preview(request.data))
+
+
 @api_view(['GET', 'POST'])
 @public_schema
 def dentist_orders(request):
@@ -288,20 +311,20 @@ def dentist_orders(request):
                     order = receipt.prescription
                     if order.dentist_account_id != account.pk or receipt.command != 'CREATE' or receipt.payload_digest != digest:
                         raise serializers.ValidationError('This idempotency key belongs to a different submission.')
-                    data = dict(PrescriptionSerializer(order).data)
+                    data = dict(PrescriptionSerializer(order, context={'request': request}).data)
                 else:
                     serializer = PrescriptionSerializer(data={**request.data, 'dentist_name': account.name}, context={'request': request})
                     serializer.is_valid(raise_exception=True)
                     order = serializer.save(dentist_account=account)
                     CaseCommandReceipt.objects.create(idempotency_key=key, prescription=order, command='CREATE', payload_digest=digest, result={'id': str(order.pk)})
-                    data = dict(PrescriptionSerializer(order).data)
+                    data = dict(PrescriptionSerializer(order, context={'request': request}).data)
                     data['delivery_pin_once'] = order._new_delivery_pin
         return Response({**data, 'laboratory_name': lab.name, 'laboratory_id': lab.schema_name}, status=201)
     data = []
     for lab in Client.objects.filter(is_active=True).exclude(schema_name='public'):
         with schema_context(lab.schema_name):
             orders = Prescription.objects.filter(dentist_account_id=account.pk)
-            data.extend({**row, 'laboratory_name': lab.name, 'laboratory_id': lab.schema_name} for row in PrescriptionSerializer(orders, many=True).data)
+            data.extend({**row, 'laboratory_name': lab.name, 'laboratory_id': lab.schema_name} for row in PrescriptionSerializer(orders, many=True, context={'request': request}).data)
     return Response(sorted(data, key=lambda row: row['created_at'], reverse=True))
 
 
@@ -375,6 +398,16 @@ def dentist_case_action(request, schema_name, case_id, operation):
             if operation == 'qr' and request.method == 'GET':
                 from api.documents import qr_png
                 return HttpResponse(qr_png(order), content_type='image/png')
+            if operation == 'invoice-balance' and request.method == 'GET':
+                line = getattr(order, 'statement_line', None)
+                invoice = getattr(line.period, 'invoice', None) if line else None
+                if invoice is None or invoice.period.clinic.platform_dentist_id != account.pk:
+                    return Response({'detail': 'Invoice not available.'}, status=404)
+                from api.business_views import InvoiceSerializer
+                # Finance-only identities and other invoice cases stay out of this view.
+                data = InvoiceSerializer(invoice).data
+                return Response({key: data[key] for key in ['id', 'number', 'total_amount', 'paid_amount',
+                    'balance', 'payment_status', 'due_date', 'days_overdue', 'terms_days']})
             if operation == 'invoice' and request.method == 'GET':
                 from api.documents import private_open
                 line = getattr(order, 'statement_line', None)

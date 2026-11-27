@@ -1,7 +1,9 @@
 from django.urls import path
 from . import views
+from .environment import environment_info
 
 urlpatterns = [
+    path('environment/', environment_info),
     path('login/', views.demo_login), path('logout/', views.demo_logout),
     path('laboratories/', views.laboratories),
     path('accounts/', views.accounts), path('accounts/<int:account_id>/', views.accounts),
@@ -9,6 +11,7 @@ urlpatterns = [
     path('overview/', views.overview), path('logs/', views.logs),
     path('support/', views.support), path('support/<int:ticket_id>/', views.support),
     path('dentist/orders/', views.dentist_orders),
+    path('dentist/capacity-preview/', views.dentist_capacity_preview),
     path('pricing/', views.pricing_catalog),
     path('dentists/', views.dentist_directory),
     path('dentist/clinics/', views.dentist_clinics),

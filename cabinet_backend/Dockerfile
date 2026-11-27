@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --system worker \
     && useradd --system --gid worker --create-home worker \
     && mkdir -p /app/celerybeat \
-    && chown worker:worker /app/celerybeat
+    && mkdir -p /demo \
+    && chown worker:worker /app/celerybeat /demo
 
 COPY --chown=worker:worker . .
 

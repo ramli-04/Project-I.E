@@ -71,9 +71,11 @@ class InventorySerializer(serializers.ModelSerializer):
 
 
 class PartnerClinicSerializer(serializers.ModelSerializer):
+    payment_terms_days = serializers.IntegerField(min_value=0, max_value=120, required=False,
+        error_messages={key: 'Payment terms must be between 0 and 120 days.' for key in ['min_value', 'max_value', 'invalid']})
     class Meta:
         model = PartnerClinic
-        fields = ['id', 'name', 'pickup_address', 'contact_phone', 'contact_email', 'linked_dentist', 'platform_dentist']
+        fields = ['id', 'name', 'pickup_address', 'contact_phone', 'contact_email', 'linked_dentist', 'platform_dentist', 'payment_terms_days']
         read_only_fields = ['id']
 
     def validate_platform_dentist(self, value):

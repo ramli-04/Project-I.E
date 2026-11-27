@@ -275,3 +275,50 @@ class MonthlyFinancialCatalog(models.Model):
         managed = False
         db_table = 'monthly_financial_catalog'
         ordering = ['-closing_month', 'invoice_id']
+
+
+class Payment(ImmutableEvidence):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    clinic = models.ForeignKey('api.PartnerClinic', on_delete=models.PROTECT, related_name='payments')
+    method = models.CharField(max_length=10, choices=[('CHEQUE', 'Chèque'), ('LCN', 'LCN'), ('VIREMENT', 'Virement'), ('ESPECES', 'Espèces')])
+    amount = models.DecimalField(max_digits=16, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    received_on = models.DateField()
+    due_on = models.DateField(null=True, blank=True)
+    reference = models.CharField(max_length=60, blank=True)
+    bank = models.CharField(max_length=80, blank=True)
+    notes = models.TextField(blank=True)
+    recorded_by = models.CharField(max_length=255)
+    idempotency_key = models.UUIDField(unique=True)
+    payload_digest = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0, amount__lt=Decimal('100000000000000')), name='payment_positive_finite_amount'),
+            models.CheckConstraint(condition=models.Q(method__in=['CHEQUE', 'LCN', 'VIREMENT', 'ESPECES']), name='payment_valid_method'),
+            models.CheckConstraint(condition=models.Q(method='ESPECES') | ~models.Q(reference__regex=r'^\s*$'), name='payment_required_reference'),
+            models.CheckConstraint(condition=~models.Q(method='LCN') | models.Q(due_on__isnull=False), name='payment_lcn_due_date'),
+        ]
+
+
+class PaymentAllocation(ImmutableEvidence):
+    payment = models.ForeignKey(Payment, on_delete=models.PROTECT, related_name='allocations')
+    invoice = models.ForeignKey(FinanceInvoice, on_delete=models.PROTECT, related_name='allocations')
+    amount = models.DecimalField(max_digits=16, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['payment', 'invoice'], name='one_payment_invoice_allocation'),
+            models.CheckConstraint(condition=models.Q(amount__gt=0, amount__lt=Decimal('100000000000000')), name='allocation_positive_finite_amount'),
+        ]
+
+
+class PaymentReversal(ImmutableEvidence):
+    payment = models.OneToOneField(Payment, on_delete=models.PROTECT, related_name='reversal')
+    reason = models.CharField(max_length=20, choices=[('IMPAYE', 'Chèque/LCN impayé'), ('ANNULE', 'Saisie annulée')])
+    notes = models.TextField(blank=True)
+    reversed_by = models.CharField(max_length=255)
+    reversed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=models.Q(reason__in=['IMPAYE', 'ANNULE']), name='payment_valid_reversal_reason')]

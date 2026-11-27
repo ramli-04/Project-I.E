@@ -13,6 +13,9 @@ from rest_framework.test import APIClient
 
 from .models import Prescription, PrescriptionHistory
 from .signals import prescription_audit_context
+from customers.models import PlatformAccount
+from .test_support import WorkflowFixtures
+from .workflow_spec import WORKFLOW_PAYLOAD_SHAPE
 
 
 @override_settings(OUTBOX_PUBLISH_ON_COMMIT=False, CACHES={
@@ -23,20 +26,25 @@ from .signals import prescription_audit_context
         'KEY_FUNCTION': 'django_tenants.cache.make_key',
     },
 })
-class PrescriptionCQRSTests(TenantTestCase):
+class PrescriptionCQRSTests(WorkflowFixtures, TenantTestCase):
     @classmethod
     def setup_tenant(cls, tenant):
         tenant.name = 'CQRS laboratory'
 
     def setUp(self):
+        super().setUp()
         connection.set_tenant(self.tenant)
         cache.clear()
         self.client = APIClient(HTTP_HOST=self.get_test_tenant_domain())
+        with schema_context('public'):
+            self.manager = PlatformAccount.objects.create(name='CQRS manager', login_key='cqrs-manager',
+                role='LAB', laboratory=self.tenant, workstation_role='MANAGER')
+        self.client.force_authenticate(user=self.manager)
 
     def create_order(self, **changes):
         return Prescription.objects.create(
             patient_ref='CQRS-001', dentist_name='Clinic', tooth_number=11,
-            shade='A2', material='Zircone', disinfected=True, **changes,
+            **{'shade': 'A2', 'material': 'Zircone', 'disinfected': True, 'accepted': True, **changes},
         )
 
     def test_creation_and_real_transitions_append_audit_records(self):
@@ -107,22 +115,26 @@ class PrescriptionCQRSTests(TenantTestCase):
     def test_list_caches_active_orders_and_retains_optional_completed_orders(self):
         active = self.create_order()
         completed = self.create_order()
-        completed.status = 'LIVRE'
-        completed.save()
+        from .models import PartnerClinic
+        clinic = PartnerClinic.objects.create(name='Cache clinic', pickup_address='Test road')
+        for order in (active, completed):
+            order.partner_clinic = clinic
+            order.base_amount = order.total_price = 500
+            order.save()
+        self.deliver_case(completed)
         first = self.client.get('/api/prescriptions/')
         self.assertEqual(first.status_code, 200, first.data)
-        self.assertEqual([str(row['id']) for row in first.data], [str(active.pk)])
+        self.assertEqual([str(row['id']) for row in first.data['results']], [str(active.pk)])
         with CaptureQueriesContext(connection) as queries:
             second = self.client.get('/api/prescriptions/')
         self.assertEqual(second.data, first.data)
         self.assertFalse(any('FROM "api_prescription"' in query['sql'] for query in queries))
         all_orders = self.client.get('/api/prescriptions/?include_completed=true')
-        self.assertEqual(len(all_orders.data), 2)
+        self.assertEqual(len(all_orders.data['results']), 2)
         with self.captureOnCommitCallbacks(execute=True):
-            active.status = 'LIVRE'
-            active.save()
-        self.assertEqual(self.client.get('/api/prescriptions/').data, [])
-        self.assertEqual(cache.get('active_orders'), [])
+            self.deliver_case(active)
+        self.assertEqual(self.client.get('/api/prescriptions/').data['results'], [])
+        self.assertEqual(cache.get('active_orders')['rows'], [])
 
     def test_non_status_writes_refresh_serialized_cache(self):
         order = self.create_order()
@@ -130,8 +142,74 @@ class PrescriptionCQRSTests(TenantTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             order.total_price = 900
             order.save(update_fields=['total_price'])
-        self.assertEqual(self.client.get('/api/prescriptions/').data[0]['total_price'], 900)
+        self.assertEqual(self.client.get('/api/prescriptions/').data['results'][0]['total_price'], '900.00')
         self.assertEqual(order.audit_history.count(), 1)
+
+    def test_physical_cfao_case_serializes_additive_workflow_descriptors(self):
+        order = self.create_order(impression_type='PHYSIQUE', production_method='CFAO',
+                                  design_validation_requested=True, thermal_treatment='CRISTALLISATION')
+        row = self.client.get('/api/prescriptions/').data['results'][0]
+        self.assertEqual(row['current_step']['key'], 'DEMANDE_RECUE')
+        self.assertEqual(row['current_step']['kind'], 'ACCEPT')
+        self.assertEqual(row['current_step']['owner_roles'], ['RECEPTION'])
+        self.assertEqual(row['current_step']['next_key'], row['next_status'])
+        self.assertEqual(row['rework_restart_options'], [])
+        self.assertEqual([stage['key'] for stage in row['stages']], [
+            'COMMANDE', 'RECEPTION', 'CONTROLE_ENTREE', 'MODELE', 'CONCEPTION',
+            'FABRICATION', 'FINITION_QC', 'LIVRAISON', 'CLOTURE'])
+        route = {step['key']: step['label'] for stage in row['stages'] for step in stage['steps']}
+        self.assertEqual(route, {step['key']: step['label'] for step in row['workflow_steps']})
+        self.assertIn('VALIDATION_CAO', route)
+        self.assertEqual(route['TRAITEMENT_THERMIQUE'], 'Cristallisation')
+        self.assertEqual(row['status_label'], 'Demande reçue / acceptation')
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'DEMANDE_RECUE')
+        self.assertEqual(order.audit_history.count(), 1)
+
+    def test_digital_3d_case_omits_inapplicable_physical_and_cnc_steps(self):
+        self.create_order(impression_type='NUMERIQUE', production_method='IMPRESSION_3D')
+        row = self.client.get('/api/prescriptions/').data['results'][0]
+        self.assertNotIn('MODELE', [stage['key'] for stage in row['stages']])
+        route = {step['key'] for stage in row['stages'] for step in stage['steps']}
+        self.assertTrue({'PREPARATION_3D', 'IMPRESSION_3D', 'POST_POLYMERISATION'} <= route)
+        self.assertFalse({'ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO', 'COULEE_PLATRE',
+                          'USINAGE_CNC', 'TRAITEMENT_THERMIQUE', 'VALIDATION_CAO'} & route)
+        self.assertEqual(row['current_step']['next_label'], 'Analyse de la demande')
+
+    def test_cache_shape_mismatch_discards_old_rows_even_with_current_generation(self):
+        order = self.create_order()
+        first = self.client.get('/api/prescriptions/')
+        fresh = cache.get('active_orders')
+        self.assertEqual(fresh['shape'], WORKFLOW_PAYLOAD_SHAPE)
+        for shape in [None, 'obsolete-workflow-shape']:
+            with self.subTest(shape=shape):
+                stale = {'version': fresh['version'], 'rows': [{'id': 'stale-without-descriptors'}]}
+                if shape is not None:
+                    stale['shape'] = shape
+                cache.set('active_orders', stale)
+                with CaptureQueriesContext(connection) as queries:
+                    response = self.client.get('/api/prescriptions/')
+                self.assertEqual(response.status_code, 200, response.data)
+                self.assertEqual(response.data, first.data)
+                self.assertEqual(str(response.data['results'][0]['id']), str(order.pk))
+                self.assertTrue(any('FROM "api_prescription"' in query['sql'] for query in queries))
+                self.assertEqual(cache.get('active_orders')['shape'], WORKFLOW_PAYLOAD_SHAPE)
+
+    def test_cached_workflow_descriptors_are_shared_but_workstation_notes_are_filtered(self):
+        self.create_order(workstation_notes={'CAO': 'CAD-only note', 'RECEPTION': 'Reception-only note'})
+        manager_row = self.client.get('/api/prescriptions/').data['results'][0]
+        with schema_context('public'):
+            worker = PlatformAccount.objects.create(name='CQRS CAD', login_key='cqrs-cad',
+                role='LAB', laboratory=self.tenant, workstation_role='CAO')
+        self.client.force_authenticate(user=worker)
+        with CaptureQueriesContext(connection) as queries:
+            worker_row = self.client.get('/api/prescriptions/').data['results'][0]
+        self.assertFalse(any('FROM "api_prescription"' in query['sql'] for query in queries))
+        for field in ['current_step', 'stages', 'rework_restart_options']:
+            self.assertEqual(worker_row[field], manager_row[field])
+        self.assertEqual(worker_row['workstation_notes'], {'CAO': 'CAD-only note'})
+        self.assertNotIn('can_operate', worker_row['current_step'])
+        self.assertNotIn('assigned_employee', worker_row['current_step'])
 
     def test_history_and_prescriptions_are_protected_from_destructive_writes(self):
         order = self.create_order()
@@ -169,7 +247,8 @@ class PrescriptionCQRSTests(TenantTestCase):
         self.assertEqual(response.status_code, 200, response.data)
         event = order.audit_history.last()
         self.assertEqual(event.action_notes, 'Rework review')
-        self.assertEqual(event.changed_by, 'anonymous')
+        self.assertEqual(event.changed_by, f'platform:{self.manager.pk}:{self.manager.name}')
+        self.assertNotEqual(event.changed_by, 'spoofed')
         self.assertNotIn('action_notes', response.data)
 
     def test_cache_failure_does_not_abort_audited_writes_or_database_reads(self):

@@ -8,12 +8,13 @@
     "demo": "vite --mode demo --host 127.0.0.1 --port 5174",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test src/api/contracts.test.js src/planningTime.test.js",
+    "test": "node --test src/api/contracts.test.js src/api/messages.test.js src/planningTime.test.js src/planningPhases.test.js src/workQueueHelpers.test.js src/caseWorkspaceHelpers.test.js src/paymentHelpers.test.js src/toothPickerHelpers.test.js src/testCases.test.js src/planningExplain.test.js src/financeHelpers.test.js",
     "test:browser": "playwright test",
     "preview": "vite preview"
   },
   "dependencies": {
     "axios": "^1.20.0",
+    "jsqr": "1.4.0",
     "lucide-react": "^1.51.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

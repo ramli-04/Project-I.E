@@ -2,6 +2,8 @@
 import hashlib
 import json
 import uuid
+from collections.abc import Callable
+from copy import copy
 from datetime import timedelta
 from decimal import Decimal
 
@@ -16,6 +18,9 @@ from .models import (Prescription, CaseCommandReceipt, CaseInspection, CaseAttac
 from .domain import latest_inspection, REWORK_ORIGINS
 from .signals import prescription_audit_context
 from .workflow import next_status
+from .workflow_spec import Action, inspection_permitted, rework_restart_options
+
+INSPECTION_PERMITTED = inspection_permitted()
 
 CHECKS = {
     'PHYSICAL': {'deformation', 'bubbles', 'limits', 'occlusion', 'hygiene'},
@@ -85,7 +90,8 @@ def execute_case_command(order_id, command, data, actor, role, idempotency_key):
             clinic_id = Prescription.objects.values_list('partner_clinic_id', flat=True).get(pk=order_id)
             if clinic_id:
                 billing_lock(clinic_id)
-        order = Prescription.objects.select_for_update().get(pk=order_id)
+        # Serialize source writers while allowing planning's deferred FK checks.
+        order = Prescription.objects.select_for_update(no_key=True).get(pk=order_id)
         prior = CaseCommandReceipt.objects.filter(pk=key).first()
         if prior:
             if prior.prescription_id != order.pk or prior.command != command or prior.payload_digest != digest:
@@ -106,264 +112,357 @@ def allowed(role, roles):
         raise ValidationError('Your role cannot perform this command.')
 
 
+HANDLERS: dict[str, tuple[Callable, set[str] | None]] = {}
+
+
+def handler(name, roles=None):
+    def register(fn):
+        if name in HANDLERS:
+            raise ValueError(f'Duplicate workflow handler: {name}')
+        HANDLERS[name] = (fn, roles)
+        return fn
+    return register
+
+
 def _execute(order, command, data, actor, role, metadata):
-    # Update the context dictionary in place; the signal reads this same transaction's metadata.
+    # The signal reads this same transaction's mutable context dictionary.
     from .signals import _workflow_metadata
     metadata = _workflow_metadata.get()
-    if command == 'advance':
-        allowed(role, {'RECEPTION','CAO','FAO','QUALITE'})
-        from .planning import EXTERNAL
-        if 'status' in data or order.status in EXTERNAL or next_status(order) == 'VALIDATION_CAO':
-            raise ValidationError('Utilisez la commande métier spécialisée pour cette étape ; aucun statut arbitraire n’est accepté.')
-        target = next_status(order)
-        if not target:
-            raise ValidationError('Aucune étape suivante disponible.')
-        from .case_serializers import PrescriptionSerializer
-        serializer = PrescriptionSerializer(order, data={**{k:v for k,v in data.items() if k != 'notes'},
-            'action_notes':str(data.get('notes','')), 'status':target}, partial=True,
-            context={'command_role':role,'command_actor':actor,'command_action':'ADVANCE'})
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return {'status':order.status}
     if isinstance(command, str) and command.startswith('planning-'):
         from .planning import task_command
         return task_command(order, command, data, actor, role)
-    if command == 'inspection':
-        allowed(role, {'RECEPTION', 'QUALITE', 'CAO'})
-        stage, checks = data.get('stage'), data.get('checks')
-        if stage not in CHECKS or not isinstance(checks, dict) or not CHECKS[stage] <= checks.keys():
-            raise ValidationError('Supply every required check for a valid inspection stage.')
-        if any(type(checks[k]) is not bool for k in CHECKS[stage]):
-            raise ValidationError('Inspection checks must be booleans.')
-        permitted = {'PHYSICAL': {'A_CONFIRMER', 'CONTROLE_DOSSIER'}, 'DIGITAL': {'A_CONFIRMER', 'CONTROLE_DOSSIER'},
-                     'MODEL': {'CONTROLE_MODELE'}, 'QUALITY': {'CONTROLE_QUALITE'}}
-        if order.status not in permitted[stage]:
-            raise ValidationError('This inspection does not match the current workflow step.')
-        if (stage == 'PHYSICAL' and order.impression_type != 'PHYSIQUE') or (stage == 'DIGITAL' and order.impression_type != 'NUMERIQUE'):
-            raise ValidationError('Inspection track does not match the case.')
-        if stage == 'DIGITAL' and not order.attachments.filter(kind='STL').exists():
-            raise ValidationError('Upload the actual STL file before its inspection.')
-        passed = all(checks[k] for k in CHECKS[stage])
-        photo = None
-        if data.get('photo'):
-            photo = CaseAttachment.objects.filter(pk=data['photo'], prescription=order, kind='PHOTO').first()
-            if photo is None:
-                raise ValidationError('Choose a photograph from this case.')
-        if (not passed or checks.get('gap') is True) and photo is None:
-            raise ValidationError('A failed inspection or gap requires photographic evidence.')
-        if not passed and not str(data.get('notes', '')).strip():
-            raise ValidationError('Describe the non-compliance reason.')
-        inspection = CaseInspection.objects.create(prescription=order, stage=stage, checks=checks, passed=passed,
-            photo=photo, notes=str(data.get('notes', ''))[:4000], checked_by=actor,
-            production_attempt=order.production_attempt, intake_revision=order.intake_revision)
-        if stage == 'QUALITY':
-            order.quality_validated = passed
-        if not passed:
-            notify(order, 'INSPECTION_FAILED', {'inspection': inspection.pk, 'stage': stage, 'notes': inspection.notes,
-                                               'photo': str(photo.pk)})
-            if stage in {'PHYSICAL', 'DIGITAL'}:
-                metadata['action'] = 'INSPECTION_FAILED'
-                change_status(order, 'RETOUR_DEMANDE')
-            # Model/quality failures stay at their checkpoint until an explicit, measured rework command.
-        order.save()
-        return {'inspection_id': inspection.pk, 'passed': passed}
-    if command == 'rework':
-        allowed(role, {'RECEPTION', 'CAO', 'FAO', 'QUALITE', 'DENTIST'})
-        if order.status not in REWORK_ORIGINS:
-            raise ValidationError('This case is not at a rework-capable step.')
-        if role == 'DENTIST' and order.status not in {'LIVRE', 'ESSAYAGE', 'CLOTURE'}:
-            raise ValidationError('Dentists report remakes after delivery/fitting.')
-        origin, cause, action = data.get('origin'), str(data.get('cause', '')).strip(), str(data.get('corrective_action', '')).strip()
-        restart = data.get('restart_status')
-        if origin not in {'LAB', 'CLINIC'} or not cause or not action:
-            raise ValidationError('Origin, cause and corrective action are mandatory.')
-        valid = {'SALLE_CAO', 'FINITION'}
-        valid.add({'CFAO': 'PREPARATION_CNC', 'IMPRESSION_3D': 'PREPARATION_3D', 'CONVENTIONNEL': 'MODELAGE'}.get(order.production_method, 'COULEE_PLATRE'))
-        if order.impression_type == 'PHYSIQUE':
-            valid |= {'COULEE_PLATRE', 'SCAN_LABO'}
-        if restart not in valid:
-            raise ValidationError('Choose a responsible restart step from this production route.')
-        losses = data.get('losses', [])
-        if not isinstance(losses, list) or len(losses) > 100:
-            raise ValidationError('Supply a bounded list of measured losses; use [] for a zero-material correction.')
-        metadata.update({'action': 'REWORK', 'origin': origin, 'cause': cause, 'corrective_action': action,
-                         'restart_status': restart, 'losses': losses, 'cause_step': order.status})
-        order.rework_restart_status = restart
+    registered = HANDLERS.get(command)
+    if registered is None:
+        raise ValidationError('Unknown workflow command.')
+    fn, roles = registered
+    if roles is not None:
+        allowed(role, roles)
+    return fn(order, data, actor, role, metadata)
+
+
+
+@handler('accept', roles={'RECEPTION'})
+def accept(order, data, actor, role, metadata):
+    if order.accepted or order.status != 'DEMANDE_RECUE':
+        raise ValidationError('Only an unaccepted new request can be accepted and advanced.')
+    from .case_serializers import PrescriptionSerializer
+    serializer = PrescriptionSerializer(order, data={'accepted': True, 'action_notes': str(data.get('notes', ''))},
+        partial=True, context={'command_role': role, 'command_actor': actor, 'command_action': Action.ACCEPT})
+    serializer.is_valid(raise_exception=True)
+    serializer.save(status=next_status(order))
+    return {'status': order.status}
+
+
+@handler('advance', roles={'CAO', 'FAO', 'QUALITE', 'RECEPTION'})
+def advance(order, data, actor, role, metadata):
+    from .planning import EXTERNAL
+    if 'status' in data or order.status in EXTERNAL:
+        raise ValidationError('Utilisez la commande métier spécialisée pour cette étape ; aucun statut arbitraire n’est accepté.')
+    from .case_serializers import PrescriptionSerializer
+    serializer = PrescriptionSerializer(order, data={**{k:v for k,v in data.items() if k != 'notes'},
+        'action_notes':str(data.get('notes',''))}, partial=True,
+        context={'command_role':role,'command_actor':actor,'command_action':Action.ADVANCE})
+    serializer.is_valid(raise_exception=True)
+    # Compute the destination from the validated proposed route, without mutating
+    # the persisted source before its normal domain and audit guards run.
+    proposed = copy(order)
+    for field in ('production_method', 'thermal_treatment'):
+        if field in serializer.validated_data:
+            setattr(proposed, field, serializer.validated_data[field])
+    target = next_status(proposed)
+    if target == 'VALIDATION_CAO':
+        raise ValidationError('Utilisez la commande métier spécialisée pour cette étape ; aucun statut arbitraire n’est accepté.')
+    if not target:
+        raise ValidationError('Aucune étape suivante disponible.')
+    serializer.save(status=target)
+    return {'status':order.status}
+
+
+@handler('inspection', roles={'CAO', 'QUALITE', 'RECEPTION'})
+def inspection(order, data, actor, role, metadata):
+    if 'advance' in data and type(data['advance']) is not bool:
+        raise ValidationError('Inspection advance must be a boolean.')
+    stage, checks = data.get('stage'), data.get('checks')
+    if stage not in CHECKS or not isinstance(checks, dict) or not CHECKS[stage] <= checks.keys():
+        raise ValidationError('Supply every required check for a valid inspection stage.')
+    if any(type(checks[k]) is not bool for k in CHECKS[stage]):
+        raise ValidationError('Inspection checks must be booleans.')
+    if order.status not in INSPECTION_PERMITTED[stage]:
+        raise ValidationError('This inspection does not match the current workflow step.')
+    if (stage == 'PHYSICAL' and order.impression_type != 'PHYSIQUE') or (stage == 'DIGITAL' and order.impression_type != 'NUMERIQUE'):
+        raise ValidationError('Inspection track does not match the case.')
+    if stage == 'DIGITAL' and not order.attachments.filter(kind='STL').exists():
+        raise ValidationError('Upload the actual STL file before its inspection.')
+    passed = all(checks[k] for k in CHECKS[stage])
+    advanced = data.get('advance') is True and passed and order.status in {
+        'CONTROLE_DOSSIER', 'CONTROLE_MODELE', 'CONTROLE_QUALITE'}
+    if advanced:
+        from .domain import ROLE_STAGES
+        if role != 'MANAGER' and order.status not in ROLE_STAGES.get(role, set()):
+            raise ValidationError('Your workstation cannot validate and advance this inspection checkpoint.')
+    photo = None
+    if data.get('photo'):
+        photo = CaseAttachment.objects.filter(pk=data['photo'], prescription=order, kind='PHOTO').first()
+        if photo is None:
+            raise ValidationError('Choose a photograph from this case.')
+    if (not passed or checks.get('gap') is True) and photo is None:
+        raise ValidationError('A failed inspection or gap requires photographic evidence.')
+    if not passed and not str(data.get('notes', '')).strip():
+        raise ValidationError('Describe the non-compliance reason.')
+    inspection = CaseInspection.objects.create(prescription=order, stage=stage, checks=checks, passed=passed,
+        photo=photo, notes=str(data.get('notes', ''))[:4000], checked_by=actor,
+        production_attempt=order.production_attempt, intake_revision=order.intake_revision)
+    if stage == 'QUALITY':
+        order.quality_validated = passed
+    if not passed:
+        notify(order, 'INSPECTION_FAILED', {'inspection': inspection.pk, 'stage': stage, 'notes': inspection.notes,
+                                           'photo': str(photo.pk)})
+        if stage in {'PHYSICAL', 'DIGITAL'}:
+            metadata['action'] = Action.INSPECTION_FAILED
+            change_status(order, 'RETOUR_DEMANDE')
+        # Model/quality failures stay at their checkpoint until an explicit, measured rework command.
+    if advanced:
+        metadata['action'] = Action.INSPECTION_ADVANCE
+        change_status(order, next_status(order))
+    order.save()
+    if 'advance' in data:
+        return {'inspection_id': inspection.pk, 'passed': passed, 'advanced': advanced, 'status': order.status}
+    return {'inspection_id': inspection.pk, 'passed': passed}
+
+
+@handler('rework', roles={'CAO', 'DENTIST', 'FAO', 'QUALITE', 'RECEPTION'})
+def rework(order, data, actor, role, metadata):
+    if order.status not in REWORK_ORIGINS:
+        raise ValidationError('This case is not at a rework-capable step.')
+    if role == 'DENTIST' and order.status not in {'LIVRE', 'ESSAYAGE', 'CLOTURE'}:
+        raise ValidationError('Dentists report remakes after delivery/fitting.')
+    origin, cause, action = data.get('origin'), str(data.get('cause', '')).strip(), str(data.get('corrective_action', '')).strip()
+    restart = data.get('restart_status')
+    if origin not in {'LAB', 'CLINIC'} or not cause or not action:
+        raise ValidationError('Origin, cause and corrective action are mandatory.')
+    if restart not in rework_restart_options(order):
+        raise ValidationError('Choose a responsible restart step from this production route.')
+    losses = data.get('losses', [])
+    if not isinstance(losses, list) or len(losses) > 100:
+        raise ValidationError('Supply a bounded list of measured losses; use [] for a zero-material correction.')
+    metadata.update({'action': Action.REWORK, 'origin': origin, 'cause': cause, 'corrective_action': action,
+                     'restart_status': restart, 'losses': losses, 'cause_step': order.status})
+    order.rework_restart_status = restart
+    set_pause(order, False)
+    change_status(order, 'RECOULER' if restart == 'COULEE_PLATRE' else 'RESCANNER' if restart == 'SCAN_LABO' else 'A_REFAIRE')
+    order.save()
+    notify(order, 'REWORK', {'origin': origin, 'cause': cause, 'action': action, 'restart_status': restart,
+                           'original_case_id': str(order.pk), 'attempt': order.production_attempt})
+    line = StatementLine.objects.filter(prescription=order).select_related('period').first()
+    if line and line.period.closed_at is None:
+        line.contested, line.dispute_reason = True, cause
+        line.save(update_fields=['contested', 'dispute_reason'])
+    return {'original_case_id': str(order.pk), 'attempt': order.production_attempt}
+
+
+@handler('design-request', roles={'CAO'})
+def design_request(order, data, actor, role, metadata):
+    if order.status not in {'SALLE_CAO', 'VALIDATION_CAO'} or not order.design_validation_requested:
+        raise ValidationError('Dentist review must be requested on a CAO case.')
+    attachment = CaseAttachment.objects.filter(pk=data.get('attachment'), prescription=order, kind='DESIGN').first()
+    if not attachment:
+        raise ValidationError('Upload a design artifact for this case.')
+    if order.design_reviews.filter(status='PENDING').exists():
+        raise ValidationError('A design review is already pending.')
+    review = DesignReview.objects.create(prescription=order, attachment=attachment,
+        version=order.design_reviews.count() + 1, production_attempt=order.production_attempt)
+    metadata['action'] = Action.DESIGN_REQUEST
+    set_pause(order, True, 'Awaiting dentist design validation')
+    change_status(order, 'VALIDATION_CAO')
+    order.save()
+    notify(order, 'DESIGN_APPROVAL_REQUESTED', {'review_id': str(review.pk), 'version': review.version})
+    return {'review_id': str(review.pk)}
+
+
+@handler('design-decision')
+def design_decision(order, data, actor, role, metadata):
+    if role != 'DENTIST':
+        raise ValidationError('Only the owning dentist can approve or request design changes.')
+    review = order.design_reviews.select_for_update().filter(pk=data.get('review'), status='PENDING').first()
+    decision = data.get('decision')
+    if not review or decision not in {'APPROVED', 'CHANGES_REQUESTED'}:
+        raise ValidationError('Choose a pending review and valid design decision.')
+    notes = str(data.get('notes', '')).strip()
+    if decision == 'CHANGES_REQUESTED' and not notes:
+        raise ValidationError('Describe the requested design changes.')
+    review.status, review.response_notes, review.responded_at, review.responded_by = decision, notes, timezone.now(), actor
+    review.save(update_fields=['status', 'response_notes', 'responded_at', 'responded_by'])
+    metadata['action'] = Action.DESIGN_DECISION
+    if decision == 'APPROVED':
         set_pause(order, False)
-        change_status(order, 'RECOULER' if restart == 'COULEE_PLATRE' else 'RESCANNER' if restart == 'SCAN_LABO' else 'A_REFAIRE')
-        order.save()
-        notify(order, 'REWORK', {'origin': origin, 'cause': cause, 'action': action, 'restart_status': restart,
-                               'original_case_id': str(order.pk), 'attempt': order.production_attempt})
-        line = StatementLine.objects.filter(prescription=order).select_related('period').first()
-        if line and line.period.closed_at is None:
-            line.contested, line.dispute_reason = True, cause
-            line.save(update_fields=['contested', 'dispute_reason'])
-        return {'original_case_id': str(order.pk), 'attempt': order.production_attempt}
-    if command == 'design-request':
-        allowed(role, {'CAO'})
-        if order.status not in {'SALLE_CAO', 'VALIDATION_CAO'} or not order.design_validation_requested:
-            raise ValidationError('Dentist review must be requested on a CAO case.')
-        attachment = CaseAttachment.objects.filter(pk=data.get('attachment'), prescription=order, kind='DESIGN').first()
-        if not attachment:
-            raise ValidationError('Upload a design artifact for this case.')
-        if order.design_reviews.filter(status='PENDING').exists():
-            raise ValidationError('A design review is already pending.')
-        review = DesignReview.objects.create(prescription=order, attachment=attachment,
-            version=order.design_reviews.count() + 1, production_attempt=order.production_attempt)
-        metadata['action'] = 'DESIGN_REQUEST'
-        set_pause(order, True, 'Awaiting dentist design validation')
-        change_status(order, 'VALIDATION_CAO')
-        order.save()
-        notify(order, 'DESIGN_APPROVAL_REQUESTED', {'review_id': str(review.pk), 'version': review.version})
-        return {'review_id': str(review.pk)}
-    if command == 'design-decision':
-        if role != 'DENTIST':
-            raise ValidationError('Only the owning dentist can approve or request design changes.')
-        review = order.design_reviews.select_for_update().filter(pk=data.get('review'), status='PENDING').first()
-        decision = data.get('decision')
-        if not review or decision not in {'APPROVED', 'CHANGES_REQUESTED'}:
-            raise ValidationError('Choose a pending review and valid design decision.')
-        notes = str(data.get('notes', '')).strip()
-        if decision == 'CHANGES_REQUESTED' and not notes:
-            raise ValidationError('Describe the requested design changes.')
-        review.status, review.response_notes, review.responded_at, review.responded_by = decision, notes, timezone.now(), actor
-        review.save(update_fields=['status', 'response_notes', 'responded_at', 'responded_by'])
-        metadata['action'] = 'DESIGN_DECISION'
-        if decision == 'APPROVED':
-            set_pause(order, False)
-            change_status(order, next_status(order))
+        change_status(order, next_status(order))
+    else:
+        change_status(order, 'SALLE_CAO')
+    order.save()
+    notify(order, 'DESIGN_DECISION', {'review_id': str(review.pk), 'decision': decision, 'notes': notes})
+    return {'decision': decision}
+
+
+@handler('pause', roles={'CAO', 'FAO', 'QUALITE', 'RECEPTION'})
+def pause(order, data, actor, role, metadata):
+    paused = data.get('paused')
+    if type(paused) is not bool or (paused and not str(data.get('notes', '')).strip()):
+        raise ValidationError('Provide paused=true/false and a pause reason.')
+    if not paused and order.design_reviews.filter(status='PENDING').exists():
+        raise ValidationError('A pending dentist review cannot be bypassed by resuming manually.')
+    set_pause(order, paused, str(data.get('notes', '')))
+    order.save(update_fields=['is_paused', 'pause_reason', 'pause_started_at', 'deadline_suspended_seconds', 'updated_at'])
+    return {'paused': paused}
+
+
+@handler('resubmit', roles={'DENTIST', 'RECEPTION'})
+def resubmit(order, data, actor, role, metadata):
+    if order.status != 'RETOUR_DEMANDE':
+        raise ValidationError('Only a returned intake can be resubmitted.')
+    order.intake_revision += 1
+    order.reception_validated = False
+    change_status(order, 'A_CONFIRMER')
+    metadata['action'] = Action.RESUBMIT
+    order.save()
+    notify(order, 'INTAKE_RESUBMITTED', {'revision': order.intake_revision})
+    return {'revision': order.intake_revision}
+
+
+def _custody_scan(order, command, data):
+    before, after = {'pickup': ('ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO'), 'lab-deposit': ('EN_ROUTE_LABO', 'A_CONFIRMER'),
+                     'checkout': ('PRET_EXPEDITION', 'EN_ROUTE_CABINET')}[command]
+    if order.status != before:
+        raise ValidationError('This scan does not match the current custody step.')
+    verify_qr(order, data.get('qr_token'))
+    change_status(order, after)
+    order.save()
+    notify(order, 'COURIER_' + command.upper(), {'case_id': str(order.pk)})
+    return {'scanned': True}
+
+
+@handler('checkout', roles={'COURIER', 'QUALITE', 'RECEPTION'})
+def checkout(order, data, actor, role, metadata):
+    return _custody_scan(order, 'checkout', data)
+
+
+@handler('lab-deposit', roles={'COURIER', 'QUALITE', 'RECEPTION'})
+def lab_deposit(order, data, actor, role, metadata):
+    return _custody_scan(order, 'lab-deposit', data)
+
+
+@handler('pickup', roles={'COURIER', 'QUALITE', 'RECEPTION'})
+def pickup(order, data, actor, role, metadata):
+    return _custody_scan(order, 'pickup', data)
+
+
+@handler('confirm-delivery', roles={'COURIER', 'DENTIST'})
+def confirm_delivery(order, data, actor, role, metadata):
+    if order.status != 'EN_ROUTE_CABINET':
+        raise ValidationError('Checkout is required before delivery confirmation.')
+    now = timezone.now()
+    if order.pin_locked_until and order.pin_locked_until > now:
+        return {'error': 'PIN temporarily locked. Try again later.', 'http_status': 429}
+    pin = data.get('pin', '')
+    if not isinstance(pin, str) or len(pin) != 4 or not pin.isdigit() or not check_password(pin, order.delivery_pin_hash):
+        order.pin_attempts += 1
+        if order.pin_attempts >= 5:
+            order.pin_locked_until, order.pin_attempts = now + timedelta(minutes=15), 0
+        order.save(update_fields=['pin_attempts', 'pin_locked_until', 'updated_at'])
+        return {'error': 'Incorrect delivery PIN.', 'http_status': 400}
+    metadata['action'] = Action.CONFIRM_DELIVERY
+    order.delivered_at, order.pin_attempts, order.pin_locked_until = now, 0, None
+    change_status(order, 'LIVRE')
+    order.save()
+    from .billing import add_delivered_case
+    add_delivered_case(order)
+    notify(order, 'DELIVERED', {'delivered_at': now.isoformat()})
+    return {'delivered': True}
+
+
+@handler('issue-pin')
+def issue_pin(order, data, actor, role, metadata):
+    if role != 'DENTIST' or order.status in {'LIVRE', 'ESSAYAGE', 'CLOTURE'}:
+        raise ValidationError('Only the owning dentist can issue a delivery PIN before receipt.')
+    import secrets
+    pin = f'{secrets.randbelow(10000):04d}'
+    order.delivery_pin_hash = make_password(pin)
+    order.pin_attempts, order.pin_locked_until = 0, None
+    order.save(update_fields=['delivery_pin_hash', 'pin_attempts', 'pin_locked_until', 'updated_at'])
+    return {'pin_once': pin}
+
+
+@handler('fitting')
+def fitting(order, data, actor, role, metadata):
+    if role != 'DENTIST' or order.status not in {'LIVRE', 'ESSAYAGE'}:
+        raise ValidationError('The owning dentist records fitting after delivery.')
+    if data.get('passed') is not True:
+        raise ValidationError('For failed fitting, use the rework command with origin, cause and action.')
+    metadata['action'] = Action.FITTING
+    order.fitting_validated_at = timezone.now()
+    change_status(order, 'CLOTURE')
+    order.save()
+    notify(order, 'FITTING_ACCEPTED', {'original_case_id': str(order.pk)})
+    return {'passed': True}
+
+
+@handler('quote', roles={'COMPTABILITE'})
+def quote(order, data, actor, role, metadata):
+    if order.delivery_service != 'NEXT_DAY' or order.invoiced_at or order.status not in {'DEMANDE_RECUE', 'ANALYSE_DEMANDE', 'PLANIFICATION'}:
+        raise ValidationError('Manual J+1 quotes are accepted before production/invoicing.')
+    from .pricing import price_items
+    items = list(order.clinical_items.values('material'))
+    base, extra = price_items(items, 'NEXT_DAY', data.get('surcharge'))
+    if extra is None:
+        raise ValidationError('Provide the manual urgency surcharge.')
+    order.manual_surcharge, order.base_amount, order.express_surcharge, order.total_price = extra, base, extra, base + extra
+    order.save(update_fields=['manual_surcharge', 'base_amount', 'express_surcharge', 'total_price', 'updated_at'])
+    return {'total_price': str(order.total_price)}
+
+
+@handler('note', roles={'CAO', 'COMPTABILITE', 'FAO', 'QUALITE', 'RECEPTION'})
+def note(order, data, actor, role, metadata):
+    workstation = data.get('workstation', role)
+    if role != 'MANAGER' and workstation != role:
+        raise ValidationError('Edit remarks for your workstation only.')
+    order.workstation_notes = {**order.workstation_notes, workstation: str(data.get('notes', ''))[:4000]}
+    order.save(update_fields=['workstation_notes', 'updated_at'])
+    return {'saved': True}
+
+
+@handler('dispute', roles={'COMPTABILITE', 'DENTIST'})
+def dispute(order, data, actor, role, metadata):
+    reason = str(data.get('notes', '')).strip()
+    if not reason:
+        raise ValidationError('Describe the contested line.')
+    line = StatementLine.objects.filter(prescription=order).select_related('period').first()
+    invoice = None
+    if line:
+        if line.period.closed_at:
+            invoice = getattr(line.period, 'invoice', None)
         else:
-            change_status(order, 'SALLE_CAO')
-        order.save()
-        notify(order, 'DESIGN_DECISION', {'review_id': str(review.pk), 'decision': decision, 'notes': notes})
-        return {'decision': decision}
-    if command == 'pause':
-        allowed(role, {'RECEPTION', 'CAO', 'FAO', 'QUALITE'})
-        paused = data.get('paused')
-        if type(paused) is not bool or (paused and not str(data.get('notes', '')).strip()):
-            raise ValidationError('Provide paused=true/false and a pause reason.')
-        if not paused and order.design_reviews.filter(status='PENDING').exists():
-            raise ValidationError('A pending dentist review cannot be bypassed by resuming manually.')
-        set_pause(order, paused, str(data.get('notes', '')))
-        order.save(update_fields=['is_paused', 'pause_reason', 'pause_started_at', 'deadline_suspended_seconds', 'updated_at'])
-        return {'paused': paused}
-    if command == 'resubmit':
-        allowed(role, {'DENTIST', 'RECEPTION'})
-        if order.status != 'RETOUR_DEMANDE':
-            raise ValidationError('Only a returned intake can be resubmitted.')
-        order.intake_revision += 1
-        order.reception_validated = False
-        change_status(order, 'A_CONFIRMER')
-        metadata['action'] = 'RESUBMIT'
-        order.save()
-        notify(order, 'INTAKE_RESUBMITTED', {'revision': order.intake_revision})
-        return {'revision': order.intake_revision}
-    if command in {'pickup', 'lab-deposit', 'checkout'}:
-        allowed(role, {'COURIER', 'RECEPTION', 'QUALITE'})
-        before, after = {'pickup': ('ATTENTE_RAMASSAGE', 'EN_ROUTE_LABO'), 'lab-deposit': ('EN_ROUTE_LABO', 'A_CONFIRMER'),
-                         'checkout': ('PRET_EXPEDITION', 'EN_ROUTE_CABINET')}[command]
-        if order.status != before:
-            raise ValidationError('This scan does not match the current custody step.')
-        verify_qr(order, data.get('qr_token'))
-        change_status(order, after)
-        order.save()
-        notify(order, 'COURIER_' + command.upper(), {'case_id': str(order.pk)})
-        return {'scanned': True}
-    if command == 'confirm-delivery':
-        allowed(role, {'DENTIST', 'COURIER'})
-        if order.status != 'EN_ROUTE_CABINET':
-            raise ValidationError('Checkout is required before delivery confirmation.')
-        now = timezone.now()
-        if order.pin_locked_until and order.pin_locked_until > now:
-            return {'error': 'PIN temporarily locked. Try again later.', 'http_status': 429}
-        pin = data.get('pin', '')
-        if not isinstance(pin, str) or len(pin) != 4 or not pin.isdigit() or not check_password(pin, order.delivery_pin_hash):
-            order.pin_attempts += 1
-            if order.pin_attempts >= 5:
-                order.pin_locked_until, order.pin_attempts = now + timedelta(minutes=15), 0
-            order.save(update_fields=['pin_attempts', 'pin_locked_until', 'updated_at'])
-            return {'error': 'Incorrect delivery PIN.', 'http_status': 400}
-        metadata['action'] = 'CONFIRM_DELIVERY'
-        order.delivered_at, order.pin_attempts, order.pin_locked_until = now, 0, None
-        change_status(order, 'LIVRE')
-        order.save()
-        from .billing import add_delivered_case
-        add_delivered_case(order)
-        notify(order, 'DELIVERED', {'delivered_at': now.isoformat()})
-        return {'delivered': True}
-    if command == 'issue-pin':
-        if role != 'DENTIST' or order.status in {'LIVRE', 'ESSAYAGE', 'CLOTURE'}:
-            raise ValidationError('Only the owning dentist can issue a delivery PIN before receipt.')
-        import secrets
-        pin = f'{secrets.randbelow(10000):04d}'
-        order.delivery_pin_hash = make_password(pin)
-        order.pin_attempts, order.pin_locked_until = 0, None
-        order.save(update_fields=['delivery_pin_hash', 'pin_attempts', 'pin_locked_until', 'updated_at'])
-        return {'pin_once': pin}
-    if command == 'fitting':
-        if role != 'DENTIST' or order.status not in {'LIVRE', 'ESSAYAGE'}:
-            raise ValidationError('The owning dentist records fitting after delivery.')
-        if data.get('passed') is not True:
-            raise ValidationError('For failed fitting, use the rework command with origin, cause and action.')
-        metadata['action'] = 'FITTING'
-        order.fitting_validated_at = timezone.now()
-        change_status(order, 'CLOTURE')
-        order.save()
-        notify(order, 'FITTING_ACCEPTED', {'original_case_id': str(order.pk)})
-        return {'passed': True}
-    if command == 'quote':
-        allowed(role, {'COMPTABILITE'})
-        if order.delivery_service != 'NEXT_DAY' or order.invoiced_at or order.status not in {'DEMANDE_RECUE', 'ANALYSE_DEMANDE', 'PLANIFICATION'}:
-            raise ValidationError('Manual J+1 quotes are accepted before production/invoicing.')
-        from .pricing import price_items
-        items = list(order.clinical_items.values('material'))
-        base, extra = price_items(items, 'NEXT_DAY', data.get('surcharge'))
-        if extra is None:
-            raise ValidationError('Provide the manual urgency surcharge.')
-        order.manual_surcharge, order.base_amount, order.express_surcharge, order.total_price = extra, base, extra, base + extra
-        order.save(update_fields=['manual_surcharge', 'base_amount', 'express_surcharge', 'total_price', 'updated_at'])
-        return {'total_price': str(order.total_price)}
-    if command == 'note':
-        allowed(role, {'RECEPTION', 'CAO', 'FAO', 'QUALITE', 'COMPTABILITE'})
-        workstation = data.get('workstation', role)
-        if role != 'MANAGER' and workstation != role:
-            raise ValidationError('Edit remarks for your workstation only.')
-        order.workstation_notes = {**order.workstation_notes, workstation: str(data.get('notes', ''))[:4000]}
-        order.save(update_fields=['workstation_notes', 'updated_at'])
-        return {'saved': True}
-    if command == 'dispute':
-        allowed(role, {'DENTIST', 'COMPTABILITE'})
-        reason = str(data.get('notes', '')).strip()
-        if not reason:
-            raise ValidationError('Describe the contested line.')
-        line = StatementLine.objects.filter(prescription=order).select_related('period').first()
-        invoice = None
-        if line:
-            if line.period.closed_at:
-                invoice = getattr(line.period, 'invoice', None)
-            else:
-                line.contested, line.dispute_reason = True, reason
-                line.save(update_fields=['contested', 'dispute_reason'])
-        dispute = BillingDispute.objects.create(prescription=order, invoice=invoice, reason=reason, raised_by=actor)
-        notify(order, 'BILLING_DISPUTE', {'dispute': str(dispute.pk), 'reason': reason})
-        order.save(update_fields=['updated_at'])
-        return {'dispute_id': str(dispute.pk)}
-    if command == 'assess-loss':
-        allowed(role, {'QUALITE', 'FAO', 'CAO', 'RECEPTION'})
-        attempt = data.get('attempt')
-        if attempt is None:
-            attempt = order.production_attempt - 1
-        try:
-            attempt = int(attempt)
-        except (ValueError, TypeError):
-            raise ValidationError('A valid integer production attempt is required.')
-        losses = data.get('losses', [])
-        if not isinstance(losses, list) or not losses or len(losses) > 100:
-            raise ValidationError('Supply a non-empty list of measured losses; maximum 100.')
-        from .inventory import assess_rework_loss
-        notes = str(data.get('notes', '')).strip()
-        recorded = assess_rework_loss(order, attempt, losses, changed_by=actor, notes=notes)
-        notify(order, 'REWORK_LOSS_ASSESSED', {'attempt': attempt, 'losses': recorded, 'notes': notes},
-               key=f'loss-assessed:{order.pk}:{attempt}:{uuid.uuid4()}')
-        return {'attempt': attempt, 'losses': recorded}
-    raise ValidationError('Unknown workflow command.')
+            line.contested, line.dispute_reason = True, reason
+            line.save(update_fields=['contested', 'dispute_reason'])
+    dispute = BillingDispute.objects.create(prescription=order, invoice=invoice, reason=reason, raised_by=actor)
+    notify(order, 'BILLING_DISPUTE', {'dispute': str(dispute.pk), 'reason': reason})
+    order.save(update_fields=['updated_at'])
+    return {'dispute_id': str(dispute.pk)}
+
+
+@handler('assess-loss', roles={'CAO', 'FAO', 'QUALITE', 'RECEPTION'})
+def assess_loss(order, data, actor, role, metadata):
+    attempt = data.get('attempt')
+    if attempt is None:
+        attempt = order.production_attempt - 1
+    try:
+        attempt = int(attempt)
+    except (ValueError, TypeError):
+        raise ValidationError('A valid integer production attempt is required.')
+    losses = data.get('losses', [])
+    if not isinstance(losses, list) or not losses or len(losses) > 100:
+        raise ValidationError('Supply a non-empty list of measured losses; maximum 100.')
+    from .inventory import assess_rework_loss
+    notes = str(data.get('notes', '')).strip()
+    recorded = assess_rework_loss(order, attempt, losses, changed_by=actor, notes=notes)
+    notify(order, 'REWORK_LOSS_ASSESSED', {'attempt': attempt, 'losses': recorded, 'notes': notes},
+           key=f'loss-assessed:{order.pk}:{attempt}:{uuid.uuid4()}')
+    return {'attempt': attempt, 'losses': recorded}

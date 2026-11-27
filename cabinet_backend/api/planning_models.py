@@ -74,6 +74,7 @@ class EmployeeAvailability(models.Model):
 
 
 ACTIVE_BOOKINGS = ['READY', 'SCHEDULED', 'IN_PROGRESS', 'PAUSED']
+EQUIPMENT_PHASES = ['SETUP', 'CYCLE', 'AWAITING_UNLOAD', 'UNLOADING']
 
 
 class PlanningTask(models.Model):
@@ -114,6 +115,17 @@ class PlanningTask(models.Model):
     machine_type = models.CharField(max_length=20, blank=True)
     machine = models.ForeignKey('api.Machine', null=True, blank=True, on_delete=models.PROTECT, related_name='planning_tasks')
     machine_slot = models.PositiveSmallIntegerField(default=1)
+    resource_phase = models.CharField(max_length=20, default='MANUAL', choices=[
+        ('MANUAL', 'Travail manuel'), ('PLANNED', 'Cycle planifié'),
+        ('SETUP', 'Chargement / réglage'), ('CYCLE', 'Cycle autonome'),
+        ('AWAITING_UNLOAD', 'En attente de déchargement'),
+        ('UNLOADING', 'Déchargement'), ('FINISHED', 'Déchargement confirmé')])
+    setup_minutes = models.PositiveSmallIntegerField(default=10)
+    unload_minutes = models.PositiveSmallIntegerField(default=10)
+    phase_started_at = models.DateTimeField(null=True, blank=True)
+    cycle_started_at = models.DateTimeField(null=True, blank=True)
+    cycle_completed_at = models.DateTimeField(null=True, blank=True)
+    unloaded_at = models.DateTimeField(null=True, blank=True)
     dependencies = models.ManyToManyField('self', symmetrical=False, blank=True, related_name='dependents')
     assignment_mode = models.CharField(max_length=6, choices=[('AUTO', 'Automatique'), ('MANUAL', 'Manuelle')], default='AUTO')
     locked = models.BooleanField(default=False)
@@ -135,14 +147,23 @@ class PlanningTask(models.Model):
             models.CheckConstraint(condition=models.Q(planned_start__isnull=True, planned_end__isnull=True) | models.Q(planned_start__isnull=False, planned_end__gt=models.F('planned_start')), name='planning_valid_interval'),
             models.CheckConstraint(condition=models.Q(estimated_duration_minutes__gte=1), name='planning_positive_duration'),
             models.CheckConstraint(condition=models.Q(priority__gte=1, priority__lte=3), name='planning_priority_range'),
+            models.CheckConstraint(condition=models.Q(resource_phase='MANUAL') | (
+                models.Q(setup_minutes__gte=1, unload_minutes__gte=1)
+                & models.Q(estimated_duration_minutes__gt=models.F('setup_minutes') + models.F('unload_minutes'))
+            ), name='planning_phase_durations'),
             ExclusionConstraint(name='planning_employee_no_overlap', expressions=[
                 ('assigned_employee', RangeOperators.EQUAL),
-                (models.Func('planned_start', 'planned_end', models.Value('[)'), function='TSTZRANGE', output_field=DateTimeRangeField()), RangeOperators.OVERLAPS),
-            ], condition=models.Q(status__in=ACTIVE_BOOKINGS, assigned_employee__isnull=False, planned_start__isnull=False)),
+                (models.Func('resource_phase', 'planned_start', 'planned_end', 'phase_started_at',
+                    'setup_minutes', 'unload_minutes', function='api_employee_booking',
+                    output_field=DateTimeRangeField()), RangeOperators.OVERLAPS),
+            ], condition=(models.Q(status__in=ACTIVE_BOOKINGS) | models.Q(resource_phase__in=EQUIPMENT_PHASES))
+                & models.Q(assigned_employee__isnull=False, planned_start__isnull=False)),
             ExclusionConstraint(name='planning_machine_no_overlap', expressions=[
                 ('machine', RangeOperators.EQUAL), ('machine_slot', RangeOperators.EQUAL),
-                (models.Func('planned_start', 'planned_end', models.Value('[)'), function='TSTZRANGE', output_field=DateTimeRangeField()), RangeOperators.OVERLAPS),
-            ], condition=models.Q(status__in=ACTIVE_BOOKINGS, machine__isnull=False, planned_start__isnull=False)),
+                (models.Func('resource_phase', 'planned_start', 'planned_end',
+                    function='api_machine_booking', output_field=DateTimeRangeField()), RangeOperators.OVERLAPS),
+            ], condition=(models.Q(status__in=ACTIVE_BOOKINGS) | models.Q(resource_phase__in=EQUIPMENT_PHASES))
+                & models.Q(machine__isnull=False, planned_start__isnull=False)),
         ]
 
 

@@ -4,6 +4,7 @@ from django_tenants.test.cases import TenantTestCase
 from django_tenants.utils import schema_context
 from rest_framework.test import APIClient
 from .models import Domain, PlatformAccount, AccessLog
+import uuid
 
 
 class PlatformTests(TenantTestCase):
@@ -33,7 +34,7 @@ class PlatformTests(TenantTestCase):
         self.assertEqual(login['account']['role'], 'LAB')
         self.assertEqual(self.client.get('/api/prescriptions/').status_code, 200)
         self.assertEqual(self.client.post('/platform/logout/').status_code, 204)
-        self.assertEqual(self.client.post('/platform/login/', {'name': 'unknown'}, format='json').status_code, 400)
+        self.assertEqual(self.client.post('/platform/login/', {'name': 'unknown'}, format='json').status_code, 401)
         self.assertTrue(AccessLog.objects.filter(event='LOGIN', success=False).exists())
         self.assertTrue(AccessLog.objects.filter(event='LOGOUT', account=self.worker).exists())
 
@@ -49,7 +50,7 @@ class PlatformTests(TenantTestCase):
         response = self.client.post('/platform/login/', {
             'name': 'Mohamed', 'role': 'LAB', 'laboratory': self.tenant.schema_name, 'password': self.password,
         }, format='json')
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 401)
 
     def test_portal_login_enforces_role_and_laboratory(self):
         invalid = [
@@ -72,7 +73,7 @@ class PlatformTests(TenantTestCase):
         response = self.client.post('/platform/login/', {
             'name': 'Mohamed', 'role': 'LAB', 'laboratory': self.tenant.schema_name, 'password': self.password,
         }, format='json')
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 401)
 
     def test_admin_permissions_account_assignment_and_deactivation(self):
         self.assertIn(self.client.get('/platform/accounts/').status_code, [401, 403])
@@ -100,7 +101,9 @@ class PlatformTests(TenantTestCase):
         self.assertNotIn(response.data['temporary_password'], str(list(AccessLog.objects.values())))
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {old_token}')
         self.assertIn(self.client.get('/platform/dentist/orders/').status_code, [401, 403])
-        self.login('Dentiste 1')
+        self.assertEqual(self.client.post('/platform/login/',
+            {'name': 'Dentiste 1', 'password': self.password}, format='json').status_code, 401)
+        self.login('Dentiste 1', password=response.data['temporary_password'])
         self.assertEqual(self.client.get('/platform/dentist/orders/').status_code, 200)
 
     def test_lab_creation_and_order_isolation(self):
@@ -112,8 +115,10 @@ class PlatformTests(TenantTestCase):
         self.login('Labo 1 - Mohamed')
         self.assertEqual(self.client.get('/api/prescriptions/', HTTP_HOST='otherlab.localhost').status_code, 403)
         self.login('Dentiste 1')
-        payload = {'laboratory_id': 'otherlab', 'patient_ref': 'QA-ROUTING', 'dentist_name': 'Spoofed', 'tooth_number': 11, 'shade': 'A2', 'material': 'Zircone', 'disinfected': True, 'clinical_items': [{'tooth_number': 11, 'function': 'Couronne', 'form': 'Anatomique', 'shade': 'A2', 'material': 'Zircone'}], 'partner_clinic': PartnerClinic.objects.create(name='Other Clinic', pickup_address='123 Road', platform_dentist=self.dentist).pk}
-        order = self.client.post('/platform/dentist/orders/', payload, format='json')
+        with schema_context('otherlab'):
+            clinic = PartnerClinic.objects.create(name='Other Clinic', pickup_address='123 Road', platform_dentist=self.dentist)
+        payload = {'laboratory_id': 'otherlab', 'patient_ref': 'QA-ROUTING', 'dentist_name': 'Spoofed', 'tooth_number': 11, 'shade': 'A2', 'material': 'Zircone', 'disinfected': True, 'clinical_items': [{'tooth_number': 11, 'function': 'Couronne', 'form': 'Anatomique', 'shade': 'A2', 'material': 'Zircone'}], 'partner_clinic': clinic.pk}
+        order = self.client.post('/platform/dentist/orders/', payload, format='json', HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()))
         self.assertEqual(order.status_code, 201, order.data)
         self.assertEqual(order.data['dentist_name'], self.dentist.name)
         self.assertEqual(order.data['laboratory_id'], 'otherlab')
@@ -125,6 +130,32 @@ class PlatformTests(TenantTestCase):
         self.login('Dentiste 2')
         self.assertEqual(self.client.get('/platform/dentist/orders/').data, [])
         self.assertEqual(self.client.get('/api/prescriptions/').status_code, 403)
+
+    def test_dentist_receives_workflow_descriptors_without_other_cases_or_workstation_notes(self):
+        from api.models import Prescription
+        with schema_context(self.tenant.schema_name):
+            for owner in [self.dentist, self.other]:
+                Prescription.objects.create(patient_ref='DESCRIPTOR-' + str(owner.pk),
+                    dentist_name=owner.name, dentist_account=owner, tooth_number=11,
+                    shade='A1', material='E-Max', disinfected=True,
+                    impression_type='PHYSIQUE', production_method='CFAO',
+                    workstation_notes={'CAO': 'Internal CAD note', 'RECEPTION': 'Internal intake note'})
+        self.login('Dentiste 1')
+        response = self.client.get('/platform/dentist/orders/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data), 1)
+        row = response.data[0]
+        self.assertEqual(row['patient_ref'], 'DESCRIPTOR-' + str(self.dentist.pk))
+        self.assertEqual(row['current_step']['kind'], 'ACCEPT')
+        self.assertEqual(row['current_step']['next_key'], row['next_status'])
+        self.assertTrue(row['stages'])
+        self.assertEqual(row['rework_restart_options'], [])
+        self.assertEqual(row['workstation_notes'], {})
+        self.assertNotIn('Internal CAD note', str(response.data))
+        self.assertNotIn('can_operate', row['current_step'])
+        self.assertNotIn('delivery_pin', row)
+        self.assertNotIn('delivery_pin_hash', row)
+        self.assertNotIn('qr_nonce', row)
 
     def test_technical_support_and_overview(self):
         self.login('Dentiste 1')
@@ -168,7 +199,7 @@ class PlatformTests(TenantTestCase):
             'clinical_items': [{'tooth_number': 11, 'function': 'Couronne', 'form': 'Anatomique', 'shade': 'A2', 'material': 'Zircone'}],
             'partner_clinic': clinic.pk,
         }
-        order_res = self.client.post('/platform/dentist/orders/', payload, format='json')
+        order_res = self.client.post('/platform/dentist/orders/', payload, format='json', HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()))
         self.assertEqual(order_res.status_code, 201, order_res.data)
         order_id = order_res.data['id']
 

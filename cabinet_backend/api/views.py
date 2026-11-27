@@ -8,9 +8,10 @@ from rest_framework import viewsets, mixins
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import api_view, permission_classes
-from .permissions import DemoTenantPermission, LaboratoryResourcePermission
+from .permissions import DemoTenantPermission, LaboratoryResourcePermission, CapacityPreviewPermission
 from .permissions import PrescriptionPermission, actor_role
 from .case_serializers import CourierPrescriptionSerializer, actor_identity
+from .workflow_spec import WORKFLOW_PAYLOAD_SHAPE
 from .business_views import BusinessPagination, translate_error
 from .planning_views import ResourcePlanningMixin
 from rest_framework.decorators import action
@@ -129,7 +130,7 @@ class PrescriptionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         if getattr(self, '_lock_prescription', False):
-            queryset = queryset.select_for_update(of=('self',))
+            queryset = queryset.select_for_update(of=('self',), no_key=True)
         return queryset
 
     def list(self, request, *args, **kwargs):
@@ -149,12 +150,14 @@ class PrescriptionViewSet(viewsets.ModelViewSet):
         except (RedisError, OSError):
             logger.warning('Active-order cache unavailable; reading PostgreSQL.', exc_info=True)
             envelope = None
-        data = envelope.get('rows') if isinstance(envelope, dict) and envelope.get('version') == generation else None
+        data = envelope.get('rows') if (isinstance(envelope, dict)
+            and envelope.get('version') == generation
+            and envelope.get('shape') == WORKFLOW_PAYLOAD_SHAPE) else None
         if data is None:
             queryset = self.filter_queryset(self.get_queryset()).exclude(status__in=['LIVRE', 'ESSAYAGE', 'CLOTURE'])
             data = list(PrescriptionSerializer(queryset, many=True).data)
             try:
-                cache.set('active_orders', {'version': generation, 'rows': data}, timeout=3600)
+                cache.set('active_orders', {'version': generation, 'shape': WORKFLOW_PAYLOAD_SHAPE, 'rows': data}, timeout=3600)
             except (RedisError, OSError):
                 logger.warning('Could not populate active-order cache.', exc_info=True)
         if request.query_params.get('status'):
@@ -181,6 +184,12 @@ class PrescriptionViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied('Reception access is required to create a case in this laboratory.')
         serializer.save()
+
+    @action(detail=False, methods=['post'], url_path='capacity-preview',
+            permission_classes=[CapacityPreviewPermission])
+    def capacity_preview(self, request):
+        from .capacity import capacity_preview
+        return Response(capacity_preview(request.data))
 
     @action(detail=True, methods=['post'])
     def command(self, request, pk=None):

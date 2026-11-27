@@ -1,22 +1,7 @@
+from .workflow_spec import derived_labels
+
 METHODS = {'CFAO': 'CFAO / usinage CNC', 'IMPRESSION_3D': 'Impression 3D', 'CONVENTIONNEL': 'Fabrication conventionnelle'}
-LABELS = {
-    'RETOUR_DEMANDE': 'Retour demandé', 'COULEE_PLATRE': 'Coulée du plâtre', 'SCAN_LABO': 'Scan laboratoire',
-    'CONTROLE_MODELE': 'Contrôle modèle et scan', 'RESCANNER': 'Rescanner',
-    'VALIDATION_CAO': 'Validation du design par le dentiste', 'ESSAYAGE': 'Essayage clinique', 'CLOTURE': 'Essayage validé',
-    'A_REFAIRE': 'Reprise de fabrication', 'RECOULER': 'Reprise de coulée',
-    'DEMANDE_RECUE': 'Demande reçue / acceptation',
-    'ANALYSE_DEMANDE': 'Analyse de la demande', 'ATTENTE_RAMASSAGE': 'Ramassage à organiser',
-    'EN_ROUTE_LABO': 'Acheminement vers le labo', 'A_CONFIRMER': 'Réception au laboratoire',
-    'CONTROLE_DOSSIER': 'Contrôle du dossier et des empreintes', 'PLANIFICATION': 'Planification et choix technique',
-    'SALLE_CAO': 'Conception numérique / CAO', 'PREPARATION_CNC': 'Préparation FAO / placement et parcours outil',
-    'USINAGE_CNC': 'Usinage CNC', 'TRAITEMENT_THERMIQUE': 'Traitement thermique', 'FRITTAGE_9H': 'Frittage (ancien parcours)',
-    'PREPARATION_3D': 'Orientation, supports et préparation du plateau', 'IMPRESSION_3D': 'Impression 3D',
-    'LAVAGE_SECHAGE': 'Lavage et séchage', 'POST_POLYMERISATION': 'Post-polymérisation',
-    'MODELE_TRAVAIL': 'Préparation du modèle de travail', 'MODELAGE': 'Modelage / maquette',
-    'FABRICATION_MANUELLE': 'Fabrication conventionnelle', 'FINITION': 'Finition et caractérisation',
-    'CONTROLE_QUALITE': 'Contrôle qualité final', 'CONDITIONNEMENT': 'Conditionnement et documents',
-    'PRET_EXPEDITION': 'Prêt pour expédition', 'EN_ROUTE_CABINET': 'Livraison au cabinet', 'LIVRE': 'Livré',
-}
+LABELS = derived_labels()
 TREATMENTS = {'AUCUN': 'Sans traitement thermique', 'FRITTAGE': 'Frittage', 'CRISTALLISATION': 'Cristallisation', 'CUISSON': 'Cuisson'}
 
 

@@ -3,6 +3,8 @@ import api from './api/client';
 import platform from './api/platform';
 import { acceptsQuantity, allRows, quantityInput, quantityText, workstation } from './api/contracts';
 import LabConfiguration from './LabConfiguration';
+import LaboratoryIdentity from './LaboratoryIdentity';
+import OperationsDashboard from './OperationsDashboard';
 
 const roles = [['RECEPTION', 'Réception'], ['CAO', 'CAO'], ['FAO', 'FAO'], ['QUALITE', 'Qualité'], ['COURSIER', 'Coursier']];
 const sections = {
@@ -49,10 +51,11 @@ const sections = {
       { key: 'pickup_address', label: 'Adresse de ramassage', type: 'textarea' },
       { key: 'contact_phone', label: 'Téléphone', type: 'tel', maxLength: 30 },
       { key: 'contact_email', label: 'E-mail du cabinet', type: 'email', optional: true },
+      { key: 'payment_terms_days', label: 'Délai de paiement (jours)', type: 'number', min: 0, max: 120, step: 1, initial: 60, hint: 'De 0 à 120 jours, 60 par défaut. Affiché sur le suivi des factures ; aucune pénalité calculée.' },
       { key: 'platform_dentist', label: 'Compte dentiste de la plateforme', type: 'number', min: 1, step: 1, hint: 'Associez le compte pour rendre ce cabinet disponible dans ses prescriptions.' },
       { key: 'linked_dentist', label: 'ID utilisateur du dentiste', type: 'number', min: 1, step: 1, optional: true, hint: 'Facultatif : identifiant d’un utilisateur Django existant.' },
     ],
-    columns: [['name', 'Cabinet'], ['pickup_address', 'Adresse de ramassage'], ['contact_phone', 'Téléphone'], ['linked_dentist', 'Dentiste']],
+    columns: [['name', 'Cabinet'], ['pickup_address', 'Adresse de ramassage'], ['contact_phone', 'Téléphone'], ['linked_dentist', 'Dentiste'], ['payment_terms_days', 'Délai (jours)']],
   },
 };
 const tabs = Object.keys(sections);
@@ -162,7 +165,7 @@ function ResourceTable({ section, active, labelledBy }) {
         const shared = { id, disabled: Boolean(editor.id && field.createOnly), 'aria-invalid': Boolean(fieldErrors[field.key]), 'aria-describedby': `${id}-help ${id}-error`, required: !field.optional, className: inputClass };
         return <div key={field.key} className={field.type === 'textarea' ? 'sm:col-span-2' : ''}>
           <label htmlFor={id} className="mb-2 block text-sm text-slate-600">{field.label}{!field.optional && field.type !== 'checkbox' ? ' *' : ''}</label>
-          {field.key === 'platform_dentist' && dentists.length ? <select {...shared} value={form[field.key]} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.value }))}><option value="">Choisir un dentiste</option>{dentists.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}</select> : field.options ? <select {...shared} value={form[field.key]} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.value }))}>{field.options.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select> : field.type === 'textarea' ? <textarea {...shared} rows={3} value={form[field.key]} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.value }))} /> : field.type === 'checkbox' ? <input id={id} type="checkbox" checked={Boolean(form[field.key])} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.checked }))} className="h-5 w-5 accent-sky-400" /> : <input {...shared} type={field.type || 'text'} min={field.min} step={field.step} maxLength={field.maxLength} value={field.decimal ? quantityInput(form[field.key]) : form[field.key]} onChange={event => { if (!field.decimal || acceptsQuantity(event.target.value)) setForm(previous => ({ ...previous, [field.key]: field.decimal ? event.target.value.replace(',', '.') : event.target.value })); }} />}
+          {field.key === 'platform_dentist' && dentists.length ? <select {...shared} value={form[field.key]} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.value }))}><option value="">Choisir un dentiste</option>{dentists.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}</select> : field.options ? <select {...shared} value={form[field.key]} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.value }))}>{field.options.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select> : field.type === 'textarea' ? <textarea {...shared} rows={3} value={form[field.key]} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.value }))} /> : field.type === 'checkbox' ? <input id={id} type="checkbox" checked={Boolean(form[field.key])} onChange={event => setForm(previous => ({ ...previous, [field.key]: event.target.checked }))} className="h-5 w-5 accent-sky-400" /> : <input {...shared} type={field.type || 'text'} min={field.min} max={field.max} step={field.step} maxLength={field.maxLength} value={field.decimal ? quantityInput(form[field.key]) : form[field.key]} onChange={event => { if (!field.decimal || acceptsQuantity(event.target.value)) setForm(previous => ({ ...previous, [field.key]: field.decimal ? event.target.value.replace(',', '.') : event.target.value })); }} />}
           <p id={`${id}-help`} className="mt-1 text-xs text-slate-500">{field.hint}</p>
           <p id={`${id}-error`} className="mt-1 text-xs text-red-700">{[].concat(fieldErrors[field.key] || []).join(' ')}</p>
         </div>;
@@ -190,6 +193,8 @@ export default function LabBusinessConfiguration({ target }) {
   if (legacy) return <div className="space-y-5"><button type="button" onClick={() => setLegacy(false)} className={buttonClass}>← Configuration métier</button><LabConfiguration target={target} /></div>;
   return <div className="space-y-6">
     <div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-teal-700">Administration du laboratoire</p><h1 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">Configuration</h1><p className="mt-2 text-sm text-slate-500">Organisez les ressources et les partenaires de votre laboratoire.</p></div><button type="button" onClick={() => setLegacy(true)} className={buttonClass}>Anciennes fiches</button></div>
+    <LaboratoryIdentity />
+    {workstation() === 'MANAGER' && <details className="rounded-2xl border border-slate-200 bg-white p-4"><summary className="cursor-pointer font-medium">Diagnostic technique</summary><p className="mt-2 text-sm text-slate-500">Suivi des traitements automatiques (envois, actualisations). À consulter en cas d’anomalie ; les éléments terminés sont masqués par défaut.</p><div className="mt-4"><OperationsDashboard /></div></details>}
     <div role="tablist" aria-label="Configuration du laboratoire" className="flex gap-1 overflow-x-auto rounded-xl border border-slate-200/80 bg-slate-50 p-1 backdrop-blur-md">{tabs.map(key => <button key={key} type="button" role="tab" id={`config-tab-${key}`} aria-controls={`config-panel-${key}`} aria-selected={active === key} tabIndex={active === key ? 0 : -1} onClick={() => setActive(key)} onKeyDown={event => {
       if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault();

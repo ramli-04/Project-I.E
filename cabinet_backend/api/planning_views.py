@@ -18,8 +18,9 @@ from .models import EmployeeProfile, Prescription, TaskOutbox
 from .permissions import LaboratoryResourcePermission, actor_role
 from .planning import (DEFAULT_RULES, EXTERNAL, TZ, case_risk, configuration, deadline, employee_name,
                        employee_windows, lock_planning, lock_resources, request_replan, resources_changed)
-from .planning_models import EmployeeAvailability, EmployeeQualification, PlanningEvent, PlanningSettings, PlanningTask
+from .planning_models import EmployeeAvailability, EmployeeQualification, PlanningEvent, PlanningSettings, PlanningTask, EQUIPMENT_PHASES
 from .workflow import LABELS
+from .planning_phases import attended_intervals, UNATTENDED_TYPES
 
 
 @lru_cache(maxsize=4)
@@ -131,7 +132,8 @@ class SettingsSerializer(serializers.ModelSerializer):
         read_only_fields = ['id','updated_at','revision','applied_revision','last_recalculated_at']
 
     def get_defaults(self,obj):
-        return {key:{'title':LABELS.get(key,key),'role':r,'duration':d,'machine_type':m,'qualifications':[]}
+        return {key:{'title':LABELS.get(key,key),'role':r,'duration':d,'machine_type':m,'qualifications':[],
+                    'unattended':False,'setup_minutes':10,'unload_minutes':10}
                 for key,(r,d,m) in DEFAULT_RULES.items()}
 
     def validate_weights(self,value):
@@ -148,11 +150,19 @@ class SettingsSerializer(serializers.ModelSerializer):
     def validate_step_rules(self,value):
         if not isinstance(value,dict) or set(value)-DEFAULT_RULES.keys(): raise ValidationError('Étape de fabrication inconnue.')
         for step,rule in value.items():
-            if not isinstance(rule,dict) or set(rule)-{'duration','qualifications','machine_type'}: raise ValidationError('Règle de fabrication invalide.')
+            if not isinstance(rule,dict) or set(rule)-{'duration','qualifications','machine_type','unattended','setup_minutes','unload_minutes'}: raise ValidationError('Règle de fabrication invalide.')
             if type(rule.get('duration',30)) is not int or not 1 <= rule.get('duration',30) <= 1440: raise ValidationError('Durée comprise entre 1 et 1440 minutes.')
             qualifications=rule.get('qualifications',[])
             if not isinstance(qualifications,list) or len(qualifications)>30 or any(not isinstance(q,str) or not q or len(q)>64 for q in qualifications): raise ValidationError('Liste de codes de qualifications attendue.')
             if rule.get('machine_type','') not in {'','SCANNER','USINEUSE_CNC','FOUR_FRITTAGE','IMPRESSION_3D'}: raise ValidationError('Type de machine inconnu.')
+            if 'unattended' in rule and type(rule['unattended']) is not bool: raise ValidationError('unattended doit être un booléen.')
+            for key in ['setup_minutes','unload_minutes']:
+                if type(rule.get(key,10)) is not int or not 1 <= rule.get(key,10) <= 1440: raise ValidationError('Durée de phase invalide.')
+            _,default_duration,default_machine = DEFAULT_RULES[step]
+            machine_type = rule.get('machine_type',default_machine)
+            if rule.get('unattended',False):
+                if machine_type not in UNATTENDED_TYPES or rule.get('duration',default_duration) <= rule.get('setup_minutes',10)+rule.get('unload_minutes',10):
+                    raise ValidationError('Un cycle autonome exige un équipement compatible et une durée supérieure au chargement + déchargement.')
         return value
 
     def validate(self,attrs):
@@ -188,6 +198,7 @@ class TaskSerializer(serializers.ModelSerializer):
     late = serializers.SerializerMethodField()
     external = serializers.SerializerMethodField()
     can_operate = serializers.SerializerMethodField()
+    can_start_now = serializers.SerializerMethodField()
 
     class Meta:
         model = PlanningTask
@@ -197,14 +208,10 @@ class TaskSerializer(serializers.ModelSerializer):
     def get_deadline(self,obj): return deadline(obj.prescription,self.context['planning_settings'])
     def get_late(self,obj): return bool(obj.planned_end and obj.planned_end > self.get_deadline(obj))
     def get_external(self,obj): return obj.workflow_step in EXTERNAL
+    def get_can_start_now(self,obj): return actor_role(self.context['request']) == 'MANAGER'
     def get_can_operate(self,obj):
-        request=self.context['request']
-        role=actor_role(request)
-        if role=='MANAGER': return True
-        employee=obj.assigned_employee
-        if not employee or role != obj.required_role: return False
-        from customers.models import PlatformAccount
-        return employee.platform_account_id == request.user.pk if isinstance(request.user,PlatformAccount) else employee.user_id == request.user.pk
+        from .permissions import can_operate_task
+        return can_operate_task(obj, self.context['request'])
 
 
 def date_period(params):
@@ -243,7 +250,9 @@ class PlanningTaskViewSet(viewsets.ReadOnlyModelViewSet):
                 except (ValueError,TypeError) as exc: raise ValidationError(f'Filtre {key} invalide.') from exc
         if params.get('start') or params.get('end') or self.request.path.endswith('/calendar/'):
             start,end = date_period(params)
-            query = query.filter(Q(planned_start__lt=end,planned_end__gt=start)|Q(planned_start__isnull=True))
+            query = query.filter(Q(planned_start__lt=end,planned_end__gt=start)
+                | Q(planned_start__lt=end,resource_phase__in=EQUIPMENT_PHASES)
+                | Q(planned_start__isnull=True))
         if params.get('include_terminal') != 'true': query = query.exclude(status__in=['CANCELLED'])
         return query.order_by('planned_start','prescription_id','sequence','generation')
 
@@ -302,7 +311,7 @@ def recalculate_view(request):
     # Backfill accepted legacy cases one source at a time; no order locks under a tenant planning lock.
     for pk in Prescription.objects.filter(accepted=True).exclude(status='CLOTURE').order_by('pk').values_list('pk',flat=True):
         with transaction.atomic():
-            order=Prescription.objects.select_for_update().get(pk=pk)
+            order=Prescription.objects.select_for_update(no_key=True).get(pk=pk)
             lock_planning()
             event_key=f'planning:manual:{key}:{pk}'
             prior=TaskOutbox.objects.filter(event_key=event_key).first()
@@ -328,8 +337,10 @@ def workload_view(request):
         while day<=end.astimezone(TZ).date():
             capacity+=sum(max(0,(min(b,end)-max(a,start)).total_seconds()/60) for a,b in employee_windows(employee,day,settings))
             day+=timedelta(days=1)
-        assigned=[t for t in tasks if t.assigned_employee_id==employee.pk and t.planned_start and t.planned_end and t.planned_start<end and start<t.planned_end]
-        minutes=sum((min(t.planned_end,end)-max(t.planned_start,start)).total_seconds()/60 for t in assigned)
+        assigned=[t for t in tasks if t.assigned_employee_id==employee.pk
+            and any(a<end and start<b for a,b in attended_intervals(t))]
+        minutes=sum(max(0,(min(b,end)-max(a,start)).total_seconds()/60)
+            for t in assigned for a,b in attended_intervals(t))
         results.append({'employee':employee.pk,'name':employee_name(employee),'role':employee.role,
             'planned_minutes':round(minutes,2),'available_minutes':round(capacity,2),
             'utilization':round(minutes/capacity*100,2) if capacity else None,'available':employee.is_available and capacity>0,

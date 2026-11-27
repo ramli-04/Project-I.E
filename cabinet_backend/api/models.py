@@ -1,3 +1,4 @@
+from django.core.validators import MaxValueValidator
 import random
 import uuid
 from django.conf import settings
@@ -113,6 +114,7 @@ class PartnerClinic(models.Model):
     contact_phone = models.CharField(max_length=30)
     contact_email = models.EmailField(blank=True)
     platform_dentist = models.ForeignKey('customers.PlatformAccount', null=True, blank=True, on_delete=models.PROTECT, related_name='clinics')
+    payment_terms_days = models.PositiveSmallIntegerField(default=60, validators=[MaxValueValidator(120)])
     linked_dentist = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='partner_clinics',
@@ -122,6 +124,7 @@ class PartnerClinic(models.Model):
         ordering = ['name', 'pk']
         constraints = [
             models.CheckConstraint(condition=~models.Q(pickup_address=''), name='clinic_required_pickup_address'),
+            models.CheckConstraint(condition=models.Q(payment_terms_days__gte=0, payment_terms_days__lte=120), name='clinic_payment_terms_range'),
         ]
 
 
@@ -347,7 +350,7 @@ class Prescription(models.Model):
         with transaction.atomic(using=using):
             previous = None
             if not self._state.adding:
-                previous = type(self).objects.using(using).select_for_update().filter(pk=self.pk).values(
+                previous = type(self).objects.using(using).select_for_update(no_key=True).filter(pk=self.pk).values(
                     'billing_stage', 'invoiced_at', 'invoiced_amount',
                     'invoiced_clinic_name', 'total_price', 'partner_clinic_id',
                     'status', 'state_version', 'intake_version', 'tooth_number', 'shade', 'material',
@@ -385,7 +388,7 @@ class Prescription(models.Model):
                     kwargs['update_fields'] = set(kwargs.get('update_fields', fields)) | {'invoiced_at', 'invoiced_amount', 'invoiced_clinic_name'}
             super().save(*args, **kwargs)
             from .planning import source_saved
-            source_saved(self)
+            source_saved(self, previous=previous)
 
     def __str__(self):
         return f"{self.patient_ref} | Dent {self.tooth_number} | {self.material} | {self.status}"
@@ -543,7 +546,7 @@ class InventoryTransaction(models.Model):
             source_id = self.reversal_of_id or self.reclassifies_id or self.source_usage_id
             source = type(self).objects.using(using).get(pk=source_id) if source_id else None
             order_id = source.prescription_id if source else self.prescription_id
-            order = Prescription.objects.using(using).select_for_update().get(pk=order_id) if order_id else None
+            order = Prescription.objects.using(using).select_for_update(no_key=True).get(pk=order_id) if order_id else None
             item = Inventory.objects.using(using).select_for_update().get(pk=self.inventory_item_id)
             if self.production_lot_id:
                 lot = self.production_lot
@@ -682,7 +685,9 @@ from .business_models import (  # noqa: E402,F401 -- register tenant models with
     ReworkCase, BillingPeriod, StatementLine, FinanceInvoice, InvoiceDocument, CreditNote,
     CaseNotification, MessageDelivery, TenantReadVersion, MonthlyStatementCatalog,
     CaseCommandReceipt, BillingDispute,
-    CreditDocument, MonthlyFinancialCatalog,
+    CreditDocument, MonthlyFinancialCatalog, Payment, PaymentAllocation, PaymentReversal,
 )
 
 from .planning_models import (PlanningSettings, PlanningTask, EmployeeAvailability, EmployeeQualification, PlanningEvent)  # noqa: E402,F401
+
+from .laboratory_models import LaboratoryProfile  # noqa: E402,F401

@@ -21,7 +21,7 @@ def record_movement(*, inventory_item, quantity_changed, transaction_type,
         if reversal_of:
             prescription = reversal_of.prescription
         if prescription:
-            prescription = Prescription.objects.select_for_update().get(pk=prescription.pk)
+            prescription = Prescription.objects.select_for_update(no_key=True).get(pk=prescription.pk)
         item = Inventory.objects.select_for_update().get(pk=inventory_item.pk)
         existing = InventoryTransaction.objects.filter(idempotency_key=idempotency_key).first()
         if existing:
@@ -54,7 +54,7 @@ def classify_rework(history, using='default'):
     from decimal import Decimal, InvalidOperation
     from .models import ReworkCase
     with transaction.atomic(using=using):
-        order = Prescription.objects.using(using).select_for_update().get(pk=history.prescription_id)
+        order = Prescription.objects.using(using).select_for_update(no_key=True).get(pk=history.prescription_id)
         if ReworkCase.objects.using(using).filter(history=history).exists():
             return order.production_attempt
         details = history.metadata
@@ -108,7 +108,7 @@ def assess_rework_loss(order, attempt, losses, changed_by='system', notes='', us
     from decimal import Decimal, InvalidOperation
     from .models import ReworkCase
     with transaction.atomic(using=using):
-        order = Prescription.objects.using(using).select_for_update().get(pk=order.pk)
+        order = Prescription.objects.using(using).select_for_update(no_key=True).get(pk=order.pk)
         rework = ReworkCase.objects.using(using).filter(prescription=order, attempt=attempt).first()
         if rework is None:
             raise ValidationError(f'No rework record found for attempt {attempt}.')

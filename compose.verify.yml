@@ -1,0 +1,22 @@
+# Optional isolated verification stack. Always supply the separate project name:
+# docker compose -p cabinet-ui-verification -f compose.demo.yml -f compose.verify.yml up -d --build
+# Its volumes are independent of cabinet-virtual-lab; never reset the user's demo.
+name: cabinet-ui-verification
+
+services:
+  backend:
+    # Read the committed generated diagrams in the documentation freshness test.
+    volumes:
+      - ./docs:/docs:ro
+    environment:
+      GESTION_LABO_VERIFICATION: "1"
+      CORS_ALLOWED_ORIGINS: http://localhost:18081,http://127.0.0.1:18081
+      DEMO_FRONTEND_ORIGIN: http://localhost:18081
+    ports: !override
+      - "127.0.0.1:18001:8000"
+  frontend:
+    build:
+      args:
+        API_ORIGIN: http://localhost:18001
+    ports: !override
+      - "127.0.0.1:18081:8080"

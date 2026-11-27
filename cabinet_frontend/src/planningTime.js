@@ -23,6 +23,8 @@ export function labISO(value) {
   return new Date(time).toISOString();
 }
 export const labDate = value => labInput(value).slice(0,10);
+// Long French date ("30 novembre 2026") for read-only labels; inputs keep ISO values.
+export const labLongDate = value => {if(!value)return '—';const day=/^\d{4}-\d{2}-\d{2}$/.test(String(value))?String(value):labDate(value);return new Intl.DateTimeFormat('fr-FR',{timeZone:'UTC',day:'numeric',month:'long',year:'numeric'}).format(new Date(day+'T12:00:00Z'));};
 export const labTime = value => {if(!value)return 'Non planifiée';const d=display(value);return new Intl.DateTimeFormat('fr-FR',{timeZone:d.timeZone,hour:'2-digit',minute:'2-digit'}).format(d.value);};
 export const labDateTime = value => {if(!value)return '—';const d=display(value);return new Intl.DateTimeFormat('fr-FR',{timeZone:d.timeZone,dateStyle:'short',timeStyle:'short'}).format(d.value);};
 export function addDays(day,count) { const d=new Date(day+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+count);return d.toISOString().slice(0,10); }
