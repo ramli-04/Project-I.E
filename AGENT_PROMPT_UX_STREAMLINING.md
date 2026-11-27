@@ -1061,6 +1061,100 @@ Cut from the bottom of this list first; the first items are never cut.
   - `memory.md`: mark each remark done or skipped.
 - Run `.\graphify.cmd update .`. Take the snapshot `…-after-8.8`. Report in the standard format, with a table "Remarque n° → fait / reporté (raison)". **No commit.** Stop and tell the owner it is ready for the re-test.
 
+### Step 8.9: professional interactive charts (owner approved, 27 Nov 2026)
+
+**Owner decisions.**
+- Modernise **Tableau de bord, Facturation and Planning (Charge)** with interactive charts.
+- Add **synthetic history**: one to two past months of activity, created through the API, plus whatever cases the owner creates live.
+- Design reference: **TailAdmin React**, MIT licence, React 19 + Tailwind v4, the same stack as ours. Take only its dashboard look: KPI cards with trend, grid, spacing, typography. Do **not** import the template or rewrite other screens.
+- Charts: **Recharts**, MIT licence, in the shadcn/ui chart style, themed with our teal palette. Bundled, so it works offline.
+
+**Rules.**
+- Quality bar, A1–A4, a snapshot before and after each part, the freeze on **4 Dec 23:59**.
+- No commit until the owner says so.
+- No simulation containers.
+- Read-only endpoints only; no migration.
+- Before writing any chart code, load the `dataviz` skill and follow it: chart choice, palette, accessibility, tooltips.
+
+#### 8.9a: backend time series (read-only, no migration)
+- Add `GET /api/dashboard/series/?days=7|30|90`, default 30. Roles: MANAGER (all blocks), COMPTABILITE (finance blocks). Isolated per tenant. Not stored in the `active_orders` cache. Africa/Casablanca day and month boundaries.
+- **Response blocks:**
+  - `daily`: per day, `orders_created`, `orders_delivered`, `delivered_on_time` (delivered on or before the confirmed delivery date or deadline), `reworks`.
+  - `monthly_revenue`: the last 6 delivery months, base + express from statement lines, excluding excluded lines. Also the invoiced total and the net of credits, where invoices exist.
+  - `aging`: reuse the existing receivables buckets (no second formula).
+  - `team_load`: per active technician, planned minutes and available minutes for the period, from the existing workload computation (no second scheduler).
+  - `stages`: reuse the existing dashboard stage counts.
+- **Tests:**
+  - role matrix and tenant isolation;
+  - day and month boundaries in Casablanca;
+  - on-time computation;
+  - excluded lines left out;
+  - figures against a hand-checked fixture;
+  - query count bounded (no N+1).
+- Document the endpoint in `docs/BILLING_ANALYTICS.md`.
+
+#### 8.9b: chart foundation (frontend)
+- Add `recharts` at an **exact version** at least 2 weeks old that supports React 19. Record the version and licence in the report.
+- Create `src/charts/` with these shared components:
+  - `KpiCard`: value, label, delta vs the previous period with ▲/▼ **and** text, an optional sparkline. Clicking it navigates (e.g. to the filtered list).
+  - `ChartCard`: title, period selector, a "Voir les données" toggle that shows an accessible table of the same numbers, and empty/loading/error states.
+  - Themed `BarChart`, `AreaChart`, `DonutChart` and `HorizontalBars`.
+- **Styling and interaction:**
+  - Teal palette, colour-blind-safe, never colour alone.
+  - French tooltips with exact MAD and dates.
+  - Responsive at 390px.
+  - `prefers-reduced-motion` honoured.
+  - Keyboard focus on clickable bars and segments, with `aria-label`.
+
+#### 8.9c: Tableau de bord
+- **Layout, in the TailAdmin style:**
+  - **Row 1:** KPI cards. Active cases, deliveries this period (with sparkline), % on time, cases late or at risk, revenue this month, receivables over 60 days, rework rate.
+  - **Row 2:** "Dossiers par étape", a bar chart of the 9 stages. Clicking a bar opens Commandes filtered to that stage. Beside it, "Livraisons et ponctualité", an area chart of deliveries per day or week with an on-time % line, and a 7/30/90-day selector.
+  - **Row 3:** "Charge de l'équipe", horizontal bars of planned vs capacity per technician. Clicking one opens Planning filtered to that technician. Beside it, "Chiffre d'affaires par mois", a 6-month bar chart.
+  - **Row 4** (manager and accounting): "Impayés par ancienneté", a donut whose segments open Facturation → Impayés.
+- Keep the existing data sources. "À faire" stays the landing page.
+
+#### 8.9d: Facturation
+- Add a KPI strip at the top: billed this month, invoiced, received, still to collect, over 60 days.
+- Add "Chiffre d'affaires par mois" (bars) and "Impayés par ancienneté" (donut, with clickable segments).
+- The "Commandes livrées" table stays and is synced: clicking a chart month changes the table's month.
+
+#### 8.9e: Planning → Charge
+- Replace the plain "Charge" table with an interactive horizontal bar chart: planned vs available minutes per technician, grouped by role, with the utilisation % as text.
+- Hover shows the detail. Clicking switches to the calendar "Par technicien (journée)" filtered to that person.
+- Keep the table under "Voir les données".
+
+#### 8.9f: synthetic history (data, owner approved)
+- **Script:** new `demo/prepare_v1_history.py`, guarded like `prepare_v1_aging.py`. It runs inside the Docker container only. It needs the explicit env flag `GESTION_LABO_HISTORY_OK=1`, passed on the command line for this run only and never put in compose files.
+- **Clock:** it uses a **process-local clock patch** (the same technique as the aging fixture) to create history through the **real API and commands**. Never use SQL or ORM edits of case, planning or billing rows.
+- **Scope:**
+  - Two new synthetic clinics: "V1-HISTO Cabinet Atlas" and "V1-HISTO Cabinet Rif", each linked to Demo Dentist with a pickup address.
+  - About **40 cases** spread over the **8–10 weeks before the current month**, with references `V1-HISTO-…`.
+  - A realistic mix:
+    - services: mostly J+4, some J+2, a few J+1 with a quote;
+    - routes: CFAO, 3D printing and conventional;
+    - materials: Zircone, E-Max, PMMA, metal;
+    - outcomes: about 85% on time, a few late, 2–3 reworks with documented cause and corrective action.
+  - Every case is delivered through the normal custody and PIN commands and fitted. Use the presentation team accounts so team load looks realistic.
+- **Billing:**
+  - **Close only the past months' periods of the two V1-HISTO clinics** through the normal closing command, which creates the invoices.
+  - Record payments through the normal payment API: some full, some partial, and **one bounced cheque reversal**, so the aging donut has real buckets.
+  - **Never touch** SIMULATION Clinic, its November period, MY-TEST-001, TEST-2611-01, V1 cases, archived cases or any open period.
+- **Behaviour:** idempotent through a run tag and ledger. Prints only references and counts, never tokens or PINs. Add stdlib guard tests.
+- **Where to run:** rehearse first on `cabinet-ui-verification`, then run on main. Take a `pg_dump` of main first.
+- **Dates:** the history ends before the current day. Live cases created by the owner are added naturally on top.
+- **Clock check:** if the clock audit (`docs/SIMULATION_CLOCK_AUDIT.md`) shows a database-side `now()` that would make backdated rows inconsistent, **stop and report** before running on main.
+
+#### Verification and finish
+- Full quality bar:
+  - backend tests for the new endpoint and full backend suite;
+  - unit tests for the chart data helpers;
+  - mocked Playwright for each chart: render, tooltip by hover and by keyboard focus, click-through navigation, "Voir les données" table, 390px;
+  - live suite on verification.
+- Main: rebuild, run the history script (after a pg_dump), then a read-only smoke with screenshots at 1440 and 390 of the three screens. Confirm the protected cases and the November period are untouched.
+- Docs: `DEMO_GUIDE.md` (the charts and how to present them), `docs/GUIDE_UTILISATEUR.md` (manager and accounting), `README.md` features, `docs/TEST_RESULTS.md`, `memory.md`.
+- Report a table of each sub-step with its outcome. No commit.
+
 ### Step 8.6 ⛔: deployment (only on explicit instruction)
 
 Do **not** provision servers, buy domains or publish anything. If asked, first write `docs/DEPLOYMENT.md` covering:
