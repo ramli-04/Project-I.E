@@ -143,7 +143,7 @@ docker compose -f compose.demo.yml up -d     # resume (no rebuild needed)
 - `DEMO_GUIDE.md`: full click-by-click walkthrough. See the sections on QR, lots, billing and the v1.0 presentation data.
 - `docs/GUIDE_UTILISATEUR.md`: a French guide per role.
 - `docs/TEST_RESULTS.md`: latest verified results, newest first.
-- `AGENT_PROMPT_UX_STREAMLINING.md`: the development brief. Step 8.9, interactive charts and synthetic history, is the next planned work. It is **not** to be started on this PC unless the owner asks.
+- The development brief (`AGENT_PROMPT_UX_STREAMLINING.md`) is kept only on the owner's main PC, outside git. Do not start new development work on this PC unless the owner asks.
 
 ## 10. Troubleshooting
 

@@ -74,7 +74,6 @@ Quantity entry and display use **at most two decimal places**. Existing database
 
 The local **Gestion Labo v1.0** implementation includes the streamlined role-specific workspace, French contextual reason choices and top-of-screen feedback, advisory capacity, immutable payment records and reversals, receivables aging, the manager/accounting dashboard, and laboratory identity on new PDFs. Capacity at order entry is provisional and compares existing routes; it neither reserves a slot nor chooses the final route.
 
-The light simulator runs separately in `cabinet-sim`. Its three four-week reports are still being validated; see [the clock audit](docs/SIMULATION_CLOCK_AUDIT.md) and [test results](docs/TEST_RESULTS.md). Synthetic workloads are assumptions, not measurements of a real laboratory.
 
 | Deferred work | Boundary of v1.0 |
 | --- | --- |
